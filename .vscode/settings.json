@@ -1,3 +1,11 @@
 {
-    "cmake.sourceDirectory": "/home/shbyun/Coding/SLAM-RGBD/Youth.Source"
+    "cmake.sourceDirectory": "/home/shbyun/Coding/SLAM-RGBD/Youth.Source",
+    "editor.formatOnSave": true,
+    "files.associations": {
+        "istream": "cpp",
+        "stop_token": "cpp",
+        "thread": "cpp",
+        "core": "cpp",
+        "memory_resource": "cpp"
+    },
 }
