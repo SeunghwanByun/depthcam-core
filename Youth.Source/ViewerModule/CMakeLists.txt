@@ -1,7 +1,5 @@
 # ViewerModule 라이브러리 생성
 add_library(ViewerModuleLib
-    # astra_wrapper.cpp
-    # astra_wrapper.h
     viewerModule.c
     viewerModule.h
 )
@@ -14,26 +12,18 @@ find_package(GLEW REQUIRED)
 
 # OpenGL 찾기
 find_package(OpenGL REQUIRED)
+find_library(GLU_LIB GLU REQUIRED)
 
-# Astra 라이브러리 포함 및 링크
 target_include_directories(ViewerModuleLib PUBLIC
-  /astra/x86_64/include
   ${GLFW_INCLUDE_DIRS}
-  ${GLEW_INCLUDE_DIRS}
-  ${OPENGL_INCLUDE_DIR}
-)
-
-target_link_directories(ViewerModuleLib PUBLIC
-  /astra/x86_64/lib
 )
 
 # Find link libraries
 target_link_libraries(ViewerModuleLib
-    astra
-    astra_core
     glfw
     GLEW::GLEW
-    ${OPENGL_LIBRARIES}
+    OpenGL::GL
+    ${GLU_LIB}
     X11
     stdc++
     pthread

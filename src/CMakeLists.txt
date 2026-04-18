@@ -46,6 +46,7 @@ find_package(OpenGL REQUIRED)
 find_package(GLEW REQUIRED)
 find_package(glfw3 REQUIRED)
 find_package(Threads REQUIRED)
+find_package(PkgConfig REQUIRED)
 
 # include 디렉토리 (상위 include/ 폴더)
 target_include_directories(Youth PRIVATE 
@@ -59,3 +60,13 @@ target_link_libraries(Youth PRIVATE
     glfw
     Threads::Threads
 )
+
+pkg_check_modules(OPENNI2 QUIET IMPORTED_TARGET libopenni2)
+
+if(OPENNI2_FOUND)
+    message(STATUS "Using OpenNI2 backend for Youth")
+    target_link_libraries(Youth PRIVATE PkgConfig::OPENNI2)
+    target_compile_definitions(Youth PRIVATE USE_OPENNI2)
+else()
+    message(WARNING "OpenNI2 not found. Youth will use the dummy depth backend.")
+endif()

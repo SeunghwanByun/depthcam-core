@@ -16,6 +16,8 @@
 #include "ViewerModule/viewerModule.h"
 #include "LoggingModule/loggingModule.h"
 
+#define SENSOR_READY_TIMEOUT_MS 5000
+
 // 종료 시그널 핸들링
 volatile int keepRunning = 1;
 
@@ -267,12 +269,19 @@ int main(int argc, char** argv)
 
   /* Connect sensor and get sensor data. */
   initSensorModule();
-  
-  // 센서 모듈 초기화 확인
-  usleep(500000); // 0.5초
-  if(!isSensorModuleRunning()) {
-    printf("Sensor module failed to initialize! Exiting...\n");
+
+  // 센서가 실제로 프레임을 받기 시작할 때까지 대기
+  int waitedMs = 0;
+  while(waitedMs < SENSOR_READY_TIMEOUT_MS && isSensorModuleRunning() && !isSensorModuleReady()) {
+    usleep(100000);
+    waitedMs += 100;
+  }
+
+  if(!isSensorModuleRunning() || !isSensorModuleReady()) {
+    printf("Sensor module failed to become ready: %s\n", getSensorModuleStatus());
+    stopSensorModule();
     stopLoggingModule();
+    cleanupMessageQueues();
     return 1;
   }
 
@@ -285,6 +294,7 @@ int main(int argc, char** argv)
   usleep(200000);
 
   initViewerModule();
+  setViewerStatusText(getSensorModuleStatus());
 
   // 종료 콜백 설정
   setExitCallback(exitHandler);
@@ -308,6 +318,8 @@ int main(int argc, char** argv)
   // 프로그램이 종료될 때까지 대기
   // printf("Application running. Press Ctrl+C or close the window to exit.\n");
   while(keepRunning){
+    setViewerStatusText(getSensorModuleStatus());
+
     // 사용자 입력 처리 설정
     FD_ZERO(&readfds);
     FD_SET(stdin_fd, &readfds);
@@ -331,7 +343,7 @@ int main(int argc, char** argv)
     }
 
     if(!isSensorModuleRunning()){
-      printf("Sensor module stopped unexpectedly!\n");
+      printf("Sensor module stopped unexpectedly! %s\n", getSensorModuleStatus());
       keepRunning = 0;
     }
 

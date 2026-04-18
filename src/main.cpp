@@ -1,12 +1,18 @@
 #include "Viewer.hpp"
 #include "Sensor/DepthSource.hpp"
 #include "GL/UploadTex.hpp"
+#include <chrono>
 #include <iostream>
+#include <thread>
 
 int main()
 {
+    Youth::Sensor::DepthSource sensor;
     try
     {
+        sensor.start();
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+
         Youth::Viewer::Config config;
         config.width = 1280;
         config.height = 720;
@@ -16,12 +22,10 @@ int main()
         Youth::Viewer viewer(config);
         if (!viewer.ok())
         {
+            sensor.stop();
             std::cerr << "Failed to create viewer.\n";
             return 1;
         }
-
-        Youth::Sensor::DepthSource sensor;
-        sensor.start();
 
         static Youth::GL::UploadTex uploadTex;
 
@@ -42,6 +46,7 @@ int main()
     }
     catch (const std::exception &e)
     {
+        sensor.stop();
         std::cerr << "Fatal: " << e.what() << '\n';
         return 2;
     }

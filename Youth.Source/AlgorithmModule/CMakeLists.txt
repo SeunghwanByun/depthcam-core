@@ -2,12 +2,12 @@
 
 cmake_minimum_required(VERSION 3.10)
 
+set(ORB_SLAM3_ROOT_DIR "/usr/local/ORB_SLAM3" CACHE PATH "Path to the ORB_SLAM3 installation")
+
 # 컴파일러 플래그 설정
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# ORB-SLAM3 경로 설정 (필요에 따라 수정)
-set(ORB_SLAM3_ROOT_DIR "/usr/local/ORB_SLAM3")
 set(ORB_SLAM3_INCLUDE_DIR "${ORB_SLAM3_ROOT_DIR}/include")
 set(ORB_SLAM3_LIB_DIR "${ORB_SLAM3_ROOT_DIR}/lib")
 
@@ -48,8 +48,12 @@ file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/config/astra_orb_slam3_rgbd.yaml
   DESTINATION ${CMAKE_BINARY_DIR}/config)
 
 # ORB 어휘 파일 복사
-file(COPY ${ORB_SLAM3_ROOT_DIR}/Vocabulary/ORBvoc.txt
-  DESTINATION ${CMAKE_BINARY_DIR}/config)
+if(EXISTS "${ORB_SLAM3_ROOT_DIR}/Vocabulary/ORBvoc.txt")
+  file(COPY ${ORB_SLAM3_ROOT_DIR}/Vocabulary/ORBvoc.txt
+    DESTINATION ${CMAKE_BINARY_DIR}/config)
+else()
+  message(WARNING "ORB vocabulary file was not found at ${ORB_SLAM3_ROOT_DIR}/Vocabulary/ORBvoc.txt")
+endif()
 
 # 출력 디렉토리 생성
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/output)

@@ -13,6 +13,7 @@ AstraContext_t* InitializeAstraObj();
 void TerminateAstraObj(AstraContext_t* context);
 const int16_t* GetDepthDataAstraOpenGL(AstraContext_t* context, int* width, int* height);
 const uint8_t* GetColorDataAstraOpenGL(AstraContext_t* context, int* width, int* height);
+const char* GetAstraLastError(void);
 
 #ifdef __cplusplus
 }
