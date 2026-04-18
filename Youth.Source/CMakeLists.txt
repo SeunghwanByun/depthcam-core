@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.16)
 
 project(ProjectYouth)
 
+option(YOUTH_ENABLE_ALGORITHM "Build the ORB_SLAM3-based algorithm module" OFF)
+
 # Set Debugging Symbols
 # set(CMAKE_BUILD_TYPE Debug)
 
@@ -19,14 +21,18 @@ set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 # Sub directory addition
-add_subdirectory(AlgorithmModule)
 add_subdirectory(LoggingModule)
 add_subdirectory(SensorModule)
 add_subdirectory(ViewerModule)
 
+if(YOUTH_ENABLE_ALGORITHM)
+    add_subdirectory(AlgorithmModule)
+endif()
+
 # Find Library
 # OpenGL
 find_package(OpenGL REQUIRED)
+find_library(GLU_LIB GLU REQUIRED)
 find_package(GLEW REQUIRED)
 find_package(GLUT REQUIRED)
 
@@ -35,14 +41,18 @@ add_executable(Youth main.c main.h)
 
 # Find link libraries
 target_link_libraries(Youth
-    AlgorithmModuleLib
     LoggingModuleLib
     SensorModuleLib
     ViewerModuleLib
     OpenGL::GL
+    ${GLU_LIB}
     GLEW::GLEW
     GLUT::GLUT
-    GLU
     stdc++
     pthread
+    rt
 )
+
+if(YOUTH_ENABLE_ALGORITHM)
+    target_link_libraries(Youth AlgorithmModuleLib)
+endif()

@@ -38,6 +38,8 @@ GLFWwindow* window;
 
 // 종료 콜백 함수 포인터
 static ExitCallbackFunc exitCallback = NULL;
+static pthread_mutex_t viewerStatusMutex = PTHREAD_MUTEX_INITIALIZER;
+static char viewerStatusText[256] = "Waiting for sensor";
 
 // Data Buffer
 int16_t* depthDataBuffer = NULL;
@@ -83,8 +85,14 @@ void setExitCallback(ExitCallbackFunc callback){
   exitCallback = callback;
 }
 
+void setViewerStatusText(const char* text){
+  pthread_mutex_lock(&viewerStatusMutex);
+  snprintf(viewerStatusText, sizeof(viewerStatusText), "%s", text ? text : "");
+  pthread_mutex_unlock(&viewerStatusMutex);
+}
+
 // 안전한 메모리 할당 헬퍼 함수
-static void* safe_malloc(size){
+static void* safe_malloc(size_t size){
   void* ptr = malloc(size);
   if(!ptr){
     perror("malloc failed");
@@ -158,6 +166,7 @@ void initFrameReceiveStatus(FrameReceiveStatus* status, int frameId, uint32_t ti
 
 // Data Receiving Thread
 void* dataReceiveThread(void* arg){
+  (void)arg;
   printf("Viewer data receive thread started...\n");
 
   // Message Queue Feature Setting
@@ -209,9 +218,10 @@ void* dataReceiveThread(void* arg){
           if(header->frameId == receiveStatus.frameId && receiveStatus.depthDataBuffer){
             int maxDataPerMsg = MAX_MSG_SIZE - sizeof(MessageHeader);
             int offset = header->chunkIndex * maxDataPerMsg;
+            size_t depthBufferBytes = (size_t)receiveStatus.width * (size_t)receiveStatus.height * sizeof(int16_t);
 
             // 범위 체크 추가
-            if(offset + header->dataSize <= receiveStatus.width * receiveStatus.height * sizeof(int16_t)){
+            if((size_t)(offset + header->dataSize) <= depthBufferBytes){
               memcpy(receiveStatus.depthDataBuffer + offset, msgBuffer + sizeof(MessageHeader), header->dataSize);
 
               receiveStatus.receivedDepthChunks++;
@@ -231,9 +241,10 @@ void* dataReceiveThread(void* arg){
           if(header->frameId == receiveStatus.frameId && receiveStatus.colorDataBuffer){
             int maxDataPerMsg = MAX_MSG_SIZE - sizeof(MessageHeader);
             int offset = header->chunkIndex * maxDataPerMsg;
+            size_t colorBufferBytes = (size_t)receiveStatus.width * (size_t)receiveStatus.height * 3U * sizeof(uint8_t);
 
             // 범위 체크 추가
-            if(offset + header->dataSize <= receiveStatus.width * receiveStatus.height * 3 * sizeof(uint8_t)){
+            if((size_t)(offset + header->dataSize) <= colorBufferBytes){
               memcpy(receiveStatus.colorDataBuffer + offset, msgBuffer + sizeof(MessageHeader), header->dataSize);
 
               receiveStatus.receivedColorChunks++;
@@ -255,7 +266,7 @@ void* dataReceiveThread(void* arg){
 
         if(currentWidth != receiveStatus.width || currentHeight != receiveStatus.height){
           // 버퍼 크기 변경 필요
-          uint16_t* newDepthBuffer = (int16_t*)safe_malloc(receiveStatus.width * receiveStatus.height * sizeof(int16_t));
+          int16_t* newDepthBuffer = (int16_t*)safe_malloc(receiveStatus.width * receiveStatus.height * sizeof(int16_t));
           uint8_t* newColorBuffer = (uint8_t*)safe_malloc(receiveStatus.width * receiveStatus.height * 3 * sizeof(uint8_t));
 
           if(!newDepthBuffer || !newColorBuffer){
@@ -374,6 +385,7 @@ void error_callback(int error, const char* description)
 
 // 윈도우 종료 콜백
 void window_close_callback(GLFWwindow* window){
+  (void)window;
   printf("Window close callback triggered\n");
   viewerIsRunning = 0;
 
@@ -386,6 +398,8 @@ void window_close_callback(GLFWwindow* window){
 // Keyboard Callback
 void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods)
 {
+  (void)scancode;
+  (void)mods;
   if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS) {
     printf("ESC key pressed, setting window should close\n");
     glfwSetWindowShouldClose(window, GLFW_TRUE);
@@ -402,6 +416,7 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
 // Mouse Button Callback
 void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
 {
+  (void)mods;
   if (button == GLFW_MOUSE_BUTTON_LEFT) {
     if (action == GLFW_PRESS) {
       isDragging = 1;
@@ -415,6 +430,7 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
 // Mouse Moving Callback
 void cursor_position_callback(GLFWwindow* window, double xpos, double ypos)
 {
+    (void)window;
     if (isDragging) {
         int dx = xpos - lastMouseX;
         int dy = ypos - lastMouseY;
@@ -430,6 +446,8 @@ void cursor_position_callback(GLFWwindow* window, double xpos, double ypos)
 // Scroll Callback
 void scroll_callback(GLFWwindow* window, double xoffset, double yoffset)
 {
+    (void)window;
+    (void)xoffset;
     if (yoffset > 0) {
         // Zoom in
         zoom *= 1.1f;
@@ -442,6 +460,7 @@ void scroll_callback(GLFWwindow* window, double xoffset, double yoffset)
 // Window Size Change Callback
 void framebuffer_size_callback(GLFWwindow* window, int width, int height)
 {
+  (void)window;
   if(width <= 0 || height <= 0) return;
 
   glViewport(0, 0, width, height);
@@ -453,6 +472,7 @@ void framebuffer_size_callback(GLFWwindow* window, int width, int height)
 
 // Viewer Thread Function
 void* viewerThread(void* id){
+  (void)id;
   printf("Initializing GLFW...\n");
 
   if (!glfwInit()) {
@@ -472,10 +492,12 @@ void* viewerThread(void* id){
   screenHeight = GetSystemMetrics(SM_CYSCREEN);
 #elif __linux__
   Display* d = XOpenDisplay(NULL);
-  Screen* s = DefaultScreenOfDisplay(d);
-  screenWidth = s->width;
-  screenHeight = s->height;
-  XCloseDisplay(d);
+  if(d){
+    Screen* s = DefaultScreenOfDisplay(d);
+    screenWidth = s->width;
+    screenHeight = s->height;
+    XCloseDisplay(d);
+  }
 #endif
 
   // // 너무 큰 창 크기 방지
@@ -541,6 +563,12 @@ void* viewerThread(void* id){
 
   // Main loop
   while (viewerIsRunning && window && !glfwWindowShouldClose(window)) {
+    char windowTitle[320];
+    pthread_mutex_lock(&viewerStatusMutex);
+    snprintf(windowTitle, sizeof(windowTitle), "3D Viewer - %s", viewerStatusText);
+    pthread_mutex_unlock(&viewerStatusMutex);
+    glfwSetWindowTitle(window, windowTitle);
+
     display_3d_color();
     glfwPollEvents();
 
@@ -579,6 +607,7 @@ pthread_t viewer_thread_id;
 void initViewerModule(){
   printf("Initializing viewer module...\n");
   viewerIsRunning = 1;
+  setViewerStatusText("Waiting for sensor data");
   pthread_create(&viewer_thread_id, NULL, viewerThread, NULL);
 }
 

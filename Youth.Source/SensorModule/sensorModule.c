@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include "sensorModule.h"
 #include "astra_wrapper.h"
 #include "../frameDefinitions.h"
@@ -10,6 +12,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <stdarg.h>
 
 // Sensor Context
 AstraContext_t* sensorContext = NULL;
@@ -19,6 +22,7 @@ mqd_t mqSend = -1;
 
 // Thread Control Variable;
 static int sensorIsRunning = 1;
+static int sensorIsReady = 0;
 
 // 에러 카운터
 static int errorCounter = 0;
@@ -26,6 +30,18 @@ static const int MAX_CONSECUTIVE_ERRORS = 5;
 
 // 뮤텍스
 static pthread_mutex_t sensorMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t sensorStatusMutex = PTHREAD_MUTEX_INITIALIZER;
+static char sensorStatus[256] = "Sensor module not started";
+
+static void setSensorStatus(const char* fmt, ...)
+{
+  va_list args;
+  pthread_mutex_lock(&sensorStatusMutex);
+  va_start(args, fmt);
+  vsnprintf(sensorStatus, sizeof(sensorStatus), fmt, args);
+  va_end(args);
+  pthread_mutex_unlock(&sensorStatusMutex);
+}
 
 // Get Current Time (ms)
 static uint32_t getCurrentTimeMs(){
@@ -49,25 +65,33 @@ static void* safe_malloc(size_t size){
 // 안전한 Astra 센서 초기화
 static AstraContext_t* safeInitializeAstraObj(){
   printf("Attempting to initialize Astra sensor...\n");
+  setSensorStatus("Attempting to initialize Astra sensor");
 
   // 여러 번 시도
   for(int attempt = 1; attempt <= 3; attempt++){
+    setSensorStatus("Initializing sensor (attempt %d/3)", attempt);
     AstraContext_t* context = InitializeAstraObj();
     if(context){
       printf("Astra sensor initialized successfully on attempt %d\n", attempt);
+      setSensorStatus("Sensor initialized successfully");
       return context;
     }
 
     printf("Astra initialization attempt %d failed, retrying...\n", attempt);
+    setSensorStatus("%s", GetAstraLastError());
     usleep(500000); //0.5초 대기
   }
 
   printf("Failed to initialize Astra sensor after multiple attemps\n");
+  if(strlen(GetAstraLastError()) == 0){
+    setSensorStatus("Failed to initialize Astra sensor");
+  }
   return NULL;
 }
 
 void* sensorLoop(void* arg){
   printf("Sensor thread started...\n");
+  setSensorStatus("Sensor thread started");
 
   // Message Queue Feature Setting
   struct mq_attr attr;
@@ -81,6 +105,8 @@ void* sensorLoop(void* arg){
   if(mqSend == (mqd_t) - 1){
     perror("mq_open send");
     sensorIsRunning = 0;
+    sensorIsReady = 0;
+    setSensorStatus("Failed to open sensor->logger message queue");
     return NULL;
   }
 
@@ -92,6 +118,12 @@ void* sensorLoop(void* arg){
     printf("Failed to initialize Astra sensor\n");
     mq_close(mqSend);
     sensorIsRunning = 0;
+    sensorIsReady = 0;
+    if(strlen(GetAstraLastError()) > 0){
+      setSensorStatus("%s", GetAstraLastError());
+    }else{
+      setSensorStatus("Failed to initialize Astra sensor");
+    }
     return NULL;
   }
 
@@ -102,6 +134,8 @@ void* sensorLoop(void* arg){
     TerminateAstraObj(sensorContext);
     mq_close(mqSend);
     sensorIsRunning = 0;
+    sensorIsReady = 0;
+    setSensorStatus("Failed to allocate sensor message buffer");
     return NULL;
   }
 
@@ -120,6 +154,10 @@ void* sensorLoop(void* arg){
 
     if(depthData && colorData && width > 0 && height > 0){
       errorCounter = 0; // 성공적으로 데이터를 받았으므로 에러 카운터 리셋
+      if(!sensorIsReady){
+        sensorIsReady = 1;
+        setSensorStatus("Sensor ready: streaming %dx%d", width, height);
+      }
 
       frameId++;
       uint32_t timestamp = getCurrentTimeMs();
@@ -210,11 +248,18 @@ void* sensorLoop(void* arg){
       }
     }else{
       // 데이터를 가져오는데 실패
+      sensorIsReady = 0;
       errorCounter++;
       printf("Failed to get data from sensor (attempt %d/%d)\n", errorCounter, MAX_CONSECUTIVE_ERRORS);
+      if(strlen(GetAstraLastError()) > 0){
+        setSensorStatus("%s", GetAstraLastError());
+      }else{
+        setSensorStatus("Failed to get frames from sensor (%d/%d)", errorCounter, MAX_CONSECUTIVE_ERRORS);
+      }
 
       if(errorCounter >= MAX_CONSECUTIVE_ERRORS){
         printf("Too many consecutive failures, attempting to reinitialize sensor...\n");
+        setSensorStatus("Reinitializing sensor after repeated frame failures");
 
         // 센서 재초기화 시도
         pthread_mutex_lock(&sensorMutex);
@@ -232,6 +277,12 @@ void* sensorLoop(void* arg){
         if(!sensorContext){
           printf("Failed to reinitialize sensor, terminating sensor thread\n");
           sensorIsRunning = 0;
+          sensorIsReady = 0;
+          if(strlen(GetAstraLastError()) > 0){
+            setSensorStatus("%s", GetAstraLastError());
+          }else{
+            setSensorStatus("Failed to reinitialize sensor");
+          }
           break;
         }
 
@@ -252,6 +303,7 @@ void* sensorLoop(void* arg){
     TerminateAstraObj(sensorContext);
     sensorContext = NULL;
   }
+  sensorIsReady = 0;
 
   // Close Message Queue
   if(mqSend != (mqd_t) - 1){
@@ -260,6 +312,9 @@ void* sensorLoop(void* arg){
   }
 
   printf("Sensor thread termination\n");
+  if(sensorIsRunning == 0 && strlen(sensorStatus) == 0){
+    setSensorStatus("Sensor thread terminated");
+  }
   return NULL;
 }
 
@@ -268,15 +323,20 @@ pthread_t sensor_thread_id;
 void initSensorModule(){
   printf("Initializing sensor module...\n");
   sensorIsRunning = 1;
+  sensorIsReady = 0;
+  setSensorStatus("Starting sensor module");
   if(pthread_create(&sensor_thread_id, NULL, sensorLoop, NULL) != 0){
     perror("Failed to create sensor thread");
     sensorIsRunning = 0;
+    setSensorStatus("Failed to create sensor thread");
   }
 }
 
 void stopSensorModule(){
   printf("Stopping sensor module...\n");
   sensorIsRunning = 0;
+  sensorIsReady = 0;
+  setSensorStatus("Stopping sensor module");
 
   // 스레드가 적절히 종료될 때까지 대기
   struct timespec timeout;
@@ -304,10 +364,19 @@ void stopSensorModule(){
   }
 
   printf("Sensor module stopped\n");
+  setSensorStatus("Sensor module stopped");
 }
 
 int isSensorModuleRunning(void){
   return sensorIsRunning;
+}
+
+int isSensorModuleReady(void){
+  return sensorIsReady;
+}
+
+const char* getSensorModuleStatus(void){
+  return sensorStatus;
 }
 
 void requestStopSensorModule(){

@@ -10,4 +10,6 @@ void initSensorModule();
 void stopSensorModule();
 
 int isSensorModuleRunning(void);
+int isSensorModuleReady(void);
+const char* getSensorModuleStatus(void);
 #endif // SENSOR_MODULE_H

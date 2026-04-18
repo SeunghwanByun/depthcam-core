@@ -1,7 +1,7 @@
 #include "Sensor/DepthSource.hpp"
 #include <algorithm>
-#include <cstring>
 #include <chrono>
+#include <iostream>
 
 using namespace Youth::Sensor;
 
@@ -46,19 +46,39 @@ bool DepthSource::latestFrame(Frame &out)
 #include <OpenNI.h>
 void DepthSource::run()
 {
-    openni::OpenNI::initialize();
+    const auto initStatus = openni::OpenNI::initialize();
+    if (initStatus != openni::STATUS_OK)
+    {
+        std::cerr << "[DepthSource] OpenNI2 init failed: "
+                  << openni::OpenNI::getExtendedError() << '\n';
+        running_ = false;
+        return;
+    }
+
     openni::Device dev;
     if (dev.open(openni::ANY_DEVICE) != openni::STATUS_OK)
     {
-        running_ false;
+        std::cerr << "[DepthSource] Failed to open depth device: "
+                  << openni::OpenNI::getExtendedError() << '\n';
+        running_ = false;
+        openni::OpenNI::shutdown();
         return;
     }
+
+    const auto &deviceInfo = dev.getDeviceInfo();
+    std::cout << "[DepthSource] Connected device: "
+              << deviceInfo.getVendor() << ' '
+              << deviceInfo.getName() << " ("
+              << deviceInfo.getUri() << ")\n";
 
     openni::VideoStream depth;
     if (depth.create(dev, openni::SENSOR_DEPTH) != openni::STATUS_OK)
     {
+        std::cerr << "[DepthSource] Failed to create depth stream: "
+                  << openni::OpenNI::getExtendedError() << '\n';
         dev.close();
         running_ = false;
+        openni::OpenNI::shutdown();
         return;
     }
 
@@ -66,19 +86,39 @@ void DepthSource::run()
     vm.setResolution(640, 480);
     vm.setFps(30);
     vm.setPixelFormat(openni::PIXEL_FORMAT_DEPTH_1_MM);
-    depth.setVideoMode(vm);
-    depth.start();
+    if (depth.setVideoMode(vm) != openni::STATUS_OK)
+    {
+        std::cerr << "[DepthSource] Failed to set depth video mode: "
+                  << openni::OpenNI::getExtendedError() << '\n';
+        depth.destroy();
+        dev.close();
+        running_ = false;
+        openni::OpenNI::shutdown();
+        return;
+    }
+
+    if (depth.start() != openni::STATUS_OK)
+    {
+        std::cerr << "[DepthSource] Failed to start depth stream: "
+                  << openni::OpenNI::getExtendedError() << '\n';
+        depth.destroy();
+        dev.close();
+        running_ = false;
+        openni::OpenNI::shutdown();
+        return;
+    }
 
     const uint16_t min_mm = 500, max_mm = 5000;
+    bool firstFrameLogged = false;
 
     while (running_)
     {
-        openni::VideoFrameRef frame;
-        if (depth.readFrame(&frame) == openni::STATUS_OK && frame.isValid())
+        openni::VideoFrameRef depthFrame;
+        if (depth.readFrame(&depthFrame) == openni::STATUS_OK && depthFrame.isValid())
         {
-            int w = frame.getWidth();
-            int h = frame.getHeight();
-            const uint16_t *p = (const uint16_t *)frame.getData();
+            const int w = depthFrame.getWidth();
+            const int h = depthFrame.getHeight();
+            const auto *p = static_cast<const uint16_t *>(depthFrame.getData());
             Frame f;
             f.width = w;
             f.height = h;
@@ -90,6 +130,13 @@ void DepthSource::run()
             {
                 std::lock_guard<std::mutex> lk(mtx_);
                 frame_ = std::move(f);
+            }
+
+            if (!firstFrameLogged)
+            {
+                std::cout << "[DepthSource] First depth frame received: "
+                          << w << 'x' << h << '\n';
+                firstFrameLogged = true;
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -108,17 +155,17 @@ void DepthSource::run()
 {
     astra::initialize();
     astra::StreamSet sensor;
-    astra::StreamReader = reader = sensor.create_reader();
-    astra::DepthStream depth;
-    depth = reader.stream<astra::DepthStream>();
-    depth.set_mode(astra::ImageStreamMode(640, 480, 30, astra_pixel_formats::ASTRA_PIXEL_FORMAT_DEPTH_MM));
+    auto reader = sensor.create_reader();
+    auto depth = reader.stream<astra::DepthStream>();
+    depth.set_mode(astra::ImageStreamMode(
+        640, 480, 30, ASTRA_PIXEL_FORMAT_DEPTH_MM));
     depth.start();
 
     const uint16_t min_mm = 500, max_mm = 5000;
     while (running_)
     {
-        astra::Frame fframe = reader.get_latest_freame();
-        auto df = ffreame.get<astra::DepthFrame>();
+        auto astraFrame = reader.get_latest_frame();
+        auto df = astraFrame.get<astra::DepthFrame>();
         if (df.is_valid())
         {
             int w = df.width();
@@ -131,6 +178,7 @@ void DepthSource::run()
             for (int i = 0; i < w * h; ++i)
             {
                 uint16_t mm = static_cast<uint16_t>(data[i] > 0 ? data[i] : 0);
+                f.intensity[i] = normalizeDepth(mm, min_mm, max_mm);
             }
             {
                 std::lock_guard<std::mutex> lk(mtx_);
@@ -162,10 +210,10 @@ void DepthSource::run()
             {
                 f.intensity[y * w + x] = static_cast<uint8_t>((x + t) % 256);
             }
-            {
-                std::lock_guard<std::mutex> lk(mtx_);
-                frame_ = std::move(f);
-            }
+        }
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            frame_ = std::move(f);
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
