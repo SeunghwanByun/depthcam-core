@@ -28,6 +28,7 @@ target_link_libraries(ViewerModuleLib
     stdc++
     pthread
     rt
+    ZmqPublisherLib
 )
 
 # 컴파일 옵션 설정
