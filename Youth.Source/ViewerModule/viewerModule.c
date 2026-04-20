@@ -1,5 +1,8 @@
 #include "viewerModule.h"
 #include "../frameDefinitions.h"
+#ifdef YOUTH_ZMQ_ENABLED
+#include "../ZmqPublisher/zmq_publisher.h"
+#endif
 #include <pthread.h>
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
@@ -291,8 +294,16 @@ void* dataReceiveThread(void* arg){
           memcpy(depthDataBuffer, receiveStatus.depthDataBuffer, currentWidth * currentHeight * sizeof(int16_t));
           memcpy(colorDataBuffer, receiveStatus.colorDataBuffer, currentWidth * currentHeight * 3 * sizeof(uint8_t));
 
-          // currentFrameId = receiveStatus.frameId;
           hasNewData = 1;
+
+#ifdef YOUTH_ZMQ_ENABLED
+          {
+            uint64_t ts_ns = (uint64_t)receiveStatus.timestamp * 1000000ULL;
+            zmq_pub_depth_frame(ts_ns,
+                                (uint16_t)currentWidth, (uint16_t)currentHeight,
+                                depthDataBuffer, colorDataBuffer);
+          }
+#endif
         }
 
         // 상태 초기화를 위한 플래그
@@ -608,6 +619,9 @@ void initViewerModule(){
   printf("Initializing viewer module...\n");
   viewerIsRunning = 1;
   setViewerStatusText("Waiting for sensor data");
+#ifdef YOUTH_ZMQ_ENABLED
+  zmq_pub_init("tcp://*:5558");
+#endif
   pthread_create(&viewer_thread_id, NULL, viewerThread, NULL);
 }
 
@@ -624,6 +638,9 @@ void stopViewerModule(){
   }
 
   pthread_join(viewer_thread_id, NULL);
+#ifdef YOUTH_ZMQ_ENABLED
+  zmq_pub_destroy();
+#endif
   printf("Viewer module stopped\n");
 }
 

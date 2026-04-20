@@ -23,6 +23,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 # Sub directory addition
 add_subdirectory(LoggingModule)
 add_subdirectory(SensorModule)
+add_subdirectory(ZmqPublisher)
 add_subdirectory(ViewerModule)
 
 if(YOUTH_ENABLE_ALGORITHM)
@@ -44,6 +45,7 @@ target_link_libraries(Youth
     LoggingModuleLib
     SensorModuleLib
     ViewerModuleLib
+    ZmqPublisherLib
     OpenGL::GL
     ${GLU_LIB}
     GLEW::GLEW

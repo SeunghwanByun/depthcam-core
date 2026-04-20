@@ -19,6 +19,18 @@ if(NOT ASTRA_SDK_PATH AND EXISTS "/astra/x86_64")
   set(ASTRA_SDK_PATH "/astra/x86_64")
 endif()
 
+if(NOT ASTRA_SDK_PATH)
+  file(GLOB _ASTRA_CANDIDATES
+    "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/AstraSDK*/AstraSDK*Ubuntu*x86_64"
+  )
+  foreach(_candidate IN LISTS _ASTRA_CANDIDATES)
+    if(EXISTS "${_candidate}/include" AND EXISTS "${_candidate}/lib")
+      set(ASTRA_SDK_PATH "${_candidate}")
+      break()
+    endif()
+  endforeach()
+endif()
+
 if(ASTRA_SDK_PATH AND EXISTS "${ASTRA_SDK_PATH}/include" AND EXISTS "${ASTRA_SDK_PATH}/lib")
   find_library(ASTRA_CAPI_LIB astra SHARED PATHS "${ASTRA_SDK_PATH}/lib" NO_DEFAULT_PATH)
   find_library(ASTRA_CORE_LIB astra_core SHARED PATHS "${ASTRA_SDK_PATH}/lib" NO_DEFAULT_PATH)
