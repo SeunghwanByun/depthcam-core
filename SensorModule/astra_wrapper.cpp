@@ -7,6 +7,7 @@
 
 #if defined(USE_ASTRA_SDK)
 #include <astra/astra.hpp>
+#include <astra/capi/astra.h>   // for astra_update()
 #elif defined(USE_OPENNI2)
 #include <OpenNI.h>
 #else
@@ -160,7 +161,8 @@ void TerminateAstraObj(AstraContext_t* context)
 const int16_t* GetDepthDataAstraOpenGL(AstraContext_t* context, int* width, int* height)
 {
 #if defined(USE_ASTRA_SDK)
-    astra::Frame frame = context->reader->get_latest_frame();
+    astra_update();
+    astra::Frame frame = context->reader->get_latest_frame(ASTRA_TIMEOUT_RETURN_IMMEDIATELY);
     auto depthFrame = frame.get<astra::DepthFrame>();
 
     if (depthFrame.is_valid())
@@ -193,7 +195,7 @@ const int16_t* GetDepthDataAstraOpenGL(AstraContext_t* context, int* width, int*
 const uint8_t* GetColorDataAstraOpenGL(AstraContext_t* context, int* width, int* height)
 {
 #if defined(USE_ASTRA_SDK)
-    astra::Frame frame = context->reader->get_latest_frame();
+    astra::Frame frame = context->reader->get_latest_frame(ASTRA_TIMEOUT_RETURN_IMMEDIATELY);
     auto colorFrame = frame.get<astra::ColorFrame>();
 
     if (colorFrame.is_valid())

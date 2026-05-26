@@ -628,20 +628,19 @@ void initLoggingModule(){
    */
   
   // 센서->로거 큐 생성
-  mqd_t mqTemp = mq_open(MQ_SENSOR_TO_LOGGER, O_CREAT, 0644, &attr);
+  mqd_t mqTemp = mq_open(MQ_SENSOR_TO_LOGGER, O_CREAT | O_RDWR, 0644, &attr);
   if(mqTemp != (mqd_t) - 1){
     mq_close(mqTemp);
   }
 
   // 로거->뷰어 큐 생성
-  mqTemp = mq_open(MQ_LOGGER_TO_VIEWER, O_CREAT, 0644, &attr);
+  mqTemp = mq_open(MQ_LOGGER_TO_VIEWER, O_CREAT | O_RDWR, 0644, &attr);
   if(mqTemp != (mqd_t) - 1){
-
     mq_close(mqTemp);
   }
 
   // 제어 큐 생성
-  mqTemp = mq_open(MQ_CONTROL_QUEUE, O_CREAT, 0644, &attr);
+  mqTemp = mq_open(MQ_CONTROL_QUEUE, O_CREAT | O_RDWR, 0644, &attr);
   if(mqTemp != (mqd_t) - 1){
     mq_close(mqTemp);
   }
@@ -701,7 +700,7 @@ int startRecording(const char* filename){
 
 // 녹화 중지 함수
 void stopRecording(){
-  if(!isRecordingData){
+  if(isRecordingData){
     sendControlCommand(CTRL_CMD_STOP_RECORD, NULL);
   }
 }

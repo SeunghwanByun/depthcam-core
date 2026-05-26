@@ -18,12 +18,17 @@ target_include_directories(ViewerModuleLib PUBLIC
   ${GLFW_INCLUDE_DIRS}
 )
 
+# Find GLUT for HUD text rendering
+find_package(GLUT REQUIRED)
+
 # Find link libraries
 target_link_libraries(ViewerModuleLib
     glfw
     GLEW::GLEW
     OpenGL::GL
     ${GLU_LIB}
+    GLUT::GLUT
+    AlgorithmModuleLib
     X11
     stdc++
     pthread
