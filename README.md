@@ -126,6 +126,12 @@ View transitions are smoothed and mouse sensitivity accounts for viewport size
 and distance. VO rejects non-finite PnP motion or steps exceeding 0.5 m / 45 degrees
 per frame. This conservative handheld-camera guard avoids catastrophic pose
 jumps; fast motion or widely spaced frames can instead report tracking loss.
+Poses use SQPnP RANSAC plus Levenberg-Marquardt refinement, which stays stable
+on planar scenes such as walls and corridors. After a lost frame, tracking keeps
+matching against the last accepted frame for up to 15 frames before re-anchoring.
+Map points are added only on keyframes (5 cm / 5 degrees of motion) and
+deduplicated on a 3 cm voxel grid, so long recordings keep mapping instead of
+filling the point budget with repeated observations.
 It does not add SLAM relocalization or repair accumulated drift.
 
 Camera pose/image consistency and lost-tracking/reset behavior are tested by

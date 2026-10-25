@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <fstream>
 #include <condition_variable>
+#include <unordered_set>
+#include <cmath>
 
 // ─── Tuning constants ────────────────────────────────────────────────────────
 
@@ -29,6 +31,13 @@ static const int   MAX_MAP_POINTS    = 1000000;
 // depth/PnP fits must not teleport the map or the following viewer camera.
 static const double MAX_STEP_METRES = 0.5;
 static const double MAX_STEP_RADIANS = 0.7853981633974483; // 45 degrees
+// Map points are inserted only on keyframes and deduplicated per voxel, so a
+// long or static recording does not exhaust MAX_MAP_POINTS with repeats.
+static const double KEYFRAME_METRES  = 0.05;
+static const double KEYFRAME_RADIANS = 0.0872664625997165; // 5 degrees
+static const float  MAP_VOXEL_M      = 0.03f;
+// Consecutive lost frames before re-anchoring tracking on the current frame.
+static const int    MAX_LOST_FRAMES  = 15;
 
 // ─── Camera intrinsics ───────────────────────────────────────────────────────
 
@@ -45,6 +54,7 @@ static VoCameraState g_camera = {};
 static std::vector<uint8_t> g_cameraRgb;
 static std::vector<float> g_trajectory;
 static unsigned int g_cameraRevision = 0;
+static std::unordered_set<int64_t> g_mapVoxels;
 
 // ─── Worker thread state ─────────────────────────────────────────────────────
 
@@ -73,9 +83,32 @@ static cv::Mat g_prevDepthF;                    // CV_32F, metres
 static std::vector<cv::KeyPoint> g_prevKps;
 static cv::Mat g_prevDesc;
 static cv::Mat g_T_w_c;                         // 4×4 CV_64F, camera→world
+static cv::Mat g_T_w_kf;                        // pose of the last map keyframe
+static int     g_lostFrames = 0;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+static int64_t voxelKey(float x, float y, float z)
+{
+    const int64_t mask = (1 << 21) - 1;
+    int64_t ix = (int64_t)std::floor(x / MAP_VOXEL_M) & mask;
+    int64_t iy = (int64_t)std::floor(y / MAP_VOXEL_M) & mask;
+    int64_t iz = (int64_t)std::floor(z / MAP_VOXEL_M) & mask;
+    return (ix << 42) | (iy << 21) | iz;
+}
+
+// True when the camera moved far enough from the last keyframe to add map points.
+static bool isNewKeyframe()
+{
+    if (g_T_w_kf.empty()) return true;
+    cv::Mat delta = g_T_w_kf.inv() * g_T_w_c;
+    cv::Mat rvec;
+    cv::Rodrigues(delta(cv::Rect(0, 0, 3, 3)), rvec);
+    return cv::norm(delta(cv::Rect(3, 0, 1, 3))) >= KEYFRAME_METRES ||
+           cv::norm(rvec) >= KEYFRAME_RADIANS;
+}
+
+// Publishes the accepted pose/image every frame; adds map points on keyframes.
 static void addFrameToMap(const cv::Mat& colorRGB, const cv::Mat& depthF)
 {
     std::lock_guard<std::mutex> lk(g_mapMtx);
@@ -93,6 +126,8 @@ static void addFrameToMap(const cv::Mat& colorRGB, const cv::Mat& depthF)
     if(g_trajectory.size()>=30000)g_trajectory.erase(g_trajectory.begin(),g_trajectory.begin()+3000);
     for(int axis=0;axis<3;axis++)g_trajectory.push_back(g_camera.cameraToWorld[12+axis]);
 
+    if (!isNewKeyframe()) return;
+    g_T_w_kf = g_T_w_c.clone();
 
     for (int row = 0; row < depthF.rows && g_mapCount < MAX_MAP_POINTS; row += DEPTH_SAMPLE_STEP) {
         const float* drow  = depthF.ptr<float>(row);
@@ -114,6 +149,8 @@ static void addFrameToMap(const cv::Mat& colorRGB, const cv::Mat& depthF)
 
             // Store with negated coords to match viewer's OpenGL convention
             // (viewer draws live cloud as glVertex3f(-x, -y, -z) in camera space)
+            if (!g_mapVoxels.insert(voxelKey(-(float)xw, -(float)yw, -(float)zw)).second)
+                continue;
             float* slot = g_mapBuf + (size_t)g_mapCount * 6;
             slot[0] = -(float)xw;
             slot[1] = -(float)yw;
@@ -154,6 +191,8 @@ static void workerLoop()
               0,    0,    1);
 
     g_T_w_c = cv::Mat::eye(4, 4, CV_64F);
+    g_T_w_kf = cv::Mat();
+    g_lostFrames = 0;
     g_status = 0;
 
     while (g_running) {
@@ -251,6 +290,8 @@ static void workerLoop()
         bool poseOk = false;
         if ((int)pts3D.size() >= MIN_INLIERS) {
             cv::Mat rvec, tvec, inliers;
+            // SQPnP is stable on planar scenes (walls, floors) where ITERATIVE's
+            // homography initialisation flips to wildly wrong poses.
             bool ok = cv::solvePnPRansac(
                 pts3D, pts2D, K, cv::Mat(),
                 rvec, tvec,
@@ -259,13 +300,23 @@ static void workerLoop()
                 RANSAC_THRESH_PX,
                 0.999,
                 inliers,
-                cv::SOLVEPNP_ITERATIVE);
+                cv::SOLVEPNP_SQPNP) && inliers.rows >= MIN_INLIERS;
+
+            if (ok) {
+                std::vector<cv::Point3f> in3D;
+                std::vector<cv::Point2f> in2D;
+                for (int i = 0; i < inliers.rows; i++) {
+                    in3D.push_back(pts3D[inliers.at<int>(i)]);
+                    in2D.push_back(pts2D[inliers.at<int>(i)]);
+                }
+                cv::solvePnPRefineLM(in3D, in2D, K, cv::Mat(), rvec, tvec);
+            }
 
             bool plausible = ok && cv::checkRange(rvec) && cv::checkRange(tvec) &&
                 cv::norm(tvec) <= MAX_STEP_METRES && cv::norm(rvec) <= MAX_STEP_RADIANS;
             if(ok && !plausible)
                 printf("[VO] rejected implausible motion at frame %d\n", frameIdx);
-            if (plausible && inliers.rows >= MIN_INLIERS) {
+            if (plausible) {
                 // T_c1_c0: transforms prev-cam coords → curr-cam coords
                 cv::Mat T_c1_c0 = makeTFromRvecTvec(rvec, tvec);
 
@@ -275,6 +326,7 @@ static void workerLoop()
                 addFrameToMap(job.color, depthF);
                 poseOk = true;
                 g_status = 1;
+                g_lostFrames = 0;
 
                 printf("[VO] frame %d: %d inliers / %d matches, map=%d pts\n",
                        frameIdx, inliers.rows, (int)good.size(), g_mapCount);
@@ -285,6 +337,10 @@ static void workerLoop()
             g_status = 2;
             printf("[VO] frame %d: tracking lost (%d pts3D, %d matches)\n",
                    frameIdx, (int)pts3D.size(), (int)good.size());
+            // Keep matching against the last accepted frame, whose pose is known.
+            // Only after a long loss re-anchor, accepting a gap in the trajectory.
+            if (++g_lostFrames < MAX_LOST_FRAMES) continue;
+            g_lostFrames = 0;
         }
 
         // ── Store previous frame ──────────────────────────────────────────────
@@ -312,6 +368,7 @@ void voInit(float fx, float fy, float cx, float cy)
         g_mapCount = 0;
         g_camera = {};
         g_cameraRgb.clear();g_trajectory.clear();
+        g_mapVoxels.clear();
     }
 
     g_prevGray   = cv::Mat();
@@ -342,6 +399,7 @@ void voStop(void)
     g_mapBuf   = nullptr;
     g_mapCount = 0;
     g_camera = {};g_cameraRgb.clear();g_trajectory.clear();
+    g_mapVoxels.clear();
     g_status   = 0;
 
     printf("[VO] stopped\n");
