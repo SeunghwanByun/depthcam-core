@@ -47,6 +47,11 @@ static unsigned int uploadedCameraRevision=0;
 static float cameraPath[30000];
 static int cameraPathCount=0;
 static int seenPlaybackGeneration=0;
+// VO feature pipeline overlay on the left image (O key).
+static int showFeatures=1;
+static VoDebugStats debugStats={0};
+static VoDebugFeature debugFeatures[2048];
+static int debugFeatureCount=0;
 
 // Mouse drag state (left = orbit, right = pan)
 int isDragging = 0;
@@ -495,6 +500,63 @@ static void panelRect(float x, float y, float w, float h){
   glEnd();
 }
 
+static float clampf(float v,float lo,float hi);
+static const char* voReasonText(int reason){
+  switch(reason){
+    case VO_REASON_OK: return "tracking";
+    case VO_REASON_INIT: return "initialized";
+    case VO_REASON_NO_FEATURES: return "LOST: no features (textureless or dark)";
+    case VO_REASON_FEW_MATCHES: return "LOST: too few matches";
+    case VO_REASON_FEW_DEPTH: return "LOST: matches lack valid depth";
+    case VO_REASON_PNP_FAILED: return "LOST: PnP RANSAC failed";
+    case VO_REASON_IMPLAUSIBLE: return "LOST: implausible motion rejected";
+  }
+  return "";
+}
+static void featureColor(int state,float alpha){
+  if(state==VO_FEAT_INLIER)glColor4f(.3f,1,.4f,alpha);
+  else if(state==VO_FEAT_DEPTH)glColor4f(1,.85f,.2f,alpha);
+  else if(state==VO_FEAT_NO_DEPTH)glColor4f(1,.3f,.3f,alpha);
+  else glColor4f(.6f,.6f,.6f,alpha);
+}
+// Image pixel (u,v) maps to screen (x+u*sx, y+h-v*sy); the texture is drawn top row up.
+static void drawFeatureOverlay(float x,float y,float w,float h){
+  debugFeatureCount=voGetDebugFrame(&debugStats,debugFeatures,2048);
+  if(!showFeatures || debugStats.width<1 || debugStats.height<1)return;
+  float sx=w/debugStats.width, sy=h/debugStats.height;
+  glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+  glLineWidth(1);glBegin(GL_LINES);
+  for(int i=0;i<debugFeatureCount;i++){
+    const VoDebugFeature* f=&debugFeatures[i];
+    if(f->state==VO_FEAT_UNMATCHED)continue;
+    featureColor(f->state,.7f);
+    glVertex2f(x+f->prevX*sx,y+h-f->prevY*sy);glVertex2f(x+f->x*sx,y+h-f->y*sy);
+  }
+  glEnd();
+  // Draw higher pipeline stages last so inliers stay visible on top.
+  // Scale markers with the displayed image so they stay visible on HiDPI panels.
+  glPointSize(clampf(3.5f*sx,4,10));glBegin(GL_POINTS);
+  for(int state=VO_FEAT_UNMATCHED;state<=VO_FEAT_INLIER;state++)
+    for(int i=0;i<debugFeatureCount;i++){
+      const VoDebugFeature* f=&debugFeatures[i];
+      if(f->state!=state)continue;
+      featureColor(state,state==VO_FEAT_UNMATCHED?.6f:1);
+      glVertex2f(x+f->x*sx,y+h-f->y*sy);
+    }
+  glEnd();glPointSize(2);
+  // Legend in the image's top-left corner.
+  static const char* labels[4]={"unmatched","no depth","depth (PnP input)","PnP inlier"};
+  glColor4f(.03f,.05f,.08f,.75f);panelRect(x+6,y+h-24,360,18);
+  float lx=x+12;
+  for(int state=0;state<4;state++){
+    featureColor(state,1);
+    glBegin(GL_POINTS);glVertex2f(lx+3,y+h-15);glEnd();
+    drawBitmapString(lx+10,y+h-19,GLUT_BITMAP_HELVETICA_12,labels[state]);
+    lx+=10+8*strlen(labels[state])+6;
+  }
+  glDisable(GL_BLEND);
+}
+
 static void drawHUD(void){
   overlayProjection();
   int half = windowWidth / 2;
@@ -517,6 +579,14 @@ static void drawHUD(void){
   pthread_mutex_unlock(&dataMutex);
   glColor3f(.75f,.8f,.86f);
   drawBitmapString(20,windowHeight-60,GLUT_BITMAP_HELVETICA_12,text);
+  if(viewerVoActive && debugStats.frame){
+    int ok=debugStats.reason==VO_REASON_OK || debugStats.reason==VO_REASON_INIT;
+    glColor3f(ok?.4f:1,ok?.9f:.6f,ok?.5f:.2f);
+    snprintf(text,sizeof(text),"VO features %d > matches %d > with depth %d > inliers %d  |  %s",
+      debugStats.features,debugStats.matches,debugStats.withDepth,debugStats.inliers,
+      voReasonText(debugStats.reason));
+    drawBitmapString(20,windowHeight-78,GLUT_BITMAP_HELVETICA_12,text);
+  }
   snprintf(text,sizeof(text),"%s  |  points %d  |  frames %d",
     viewerVoActive ? (voGetTrackingStatus()==1?"Experimental VO: tracking":voGetTrackingStatus()==2?"Experimental VO: lost":"Experimental VO: initializing") : "Waiting for SLAM backend",
     viewerVoActive?voGetMapPointCount():0,viewerVoActive?voGetFrameCount():0);
@@ -543,7 +613,7 @@ static void drawHUD(void){
     drawBitmapString(half+30,windowHeight/2-10,GLUT_BITMAP_HELVETICA_12,"Map results will appear here. V: experimental VO preview");
   }
   glColor3f(.75f,.8f,.86f);
-  drawBitmapString(18,34,GLUT_BITMAP_HELVETICA_12,"1:RGB  2:Depth  R:Record  P:Replay  S:Stop  M:Save map  ESC:Quit");
+  drawBitmapString(18,34,GLUT_BITMAP_HELVETICA_12,"1:RGB  2:Depth  O:Features  R:Record  P:Replay  S:Stop  M:Save map  ESC:Quit");
   drawBitmapString(half+18,34,GLUT_BITMAP_HELVETICA_12,"Left:Orbit  Right:Pan  Wheel:Dolly  F:Follow  C:Camera  H:Home  I:Image");
   glColor3f(rec.writeError?1:.3f,rec.writeError?.3f:.85f,.4f);
   snprintf(text,sizeof(text),"%s | Saved: %u frames | %.1f MiB",
@@ -730,6 +800,7 @@ void display_3d_color(void){
     glTexCoord2f(0,1);glVertex2f(x,y);glTexCoord2f(1,1);glVertex2f(x+w,y);
     glTexCoord2f(1,0);glVertex2f(x+w,y+h);glTexCoord2f(0,0);glVertex2f(x,y+h);
     glEnd();glDisable(GL_TEXTURE_2D);
+    if(viewerVoActive)drawFeatureOverlay(x,y,w,h);
   }
   pthread_mutex_unlock(&dataMutex);
   glViewport(half,56,windowWidth-half,areaHeight);
@@ -830,6 +901,7 @@ void key_callback(GLFWwindow* win, int key, int scancode, int action, int mods)
     if(key==GLFW_KEY_C){cameraView=!cameraView;followCamera=1;panX=panY=0;}
     if(key==GLFW_KEY_H)resetView();
     if(key==GLFW_KEY_I)showCameraImage=!showCameraImage;
+    if(key==GLFW_KEY_O)showFeatures=!showFeatures;
   }
 
   // R: start recording (auto timestamped filename)

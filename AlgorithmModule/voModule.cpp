@@ -56,6 +56,11 @@ static std::vector<float> g_trajectory;
 static unsigned int g_cameraRevision = 0;
 static std::unordered_set<int64_t> g_mapVoxels;
 
+// Debug snapshot of the last processed frame, guarded by g_debugMtx.
+static std::mutex g_debugMtx;
+static VoDebugStats g_debugStats = {};
+static std::vector<VoDebugFeature> g_debugFeatures;
+
 // ─── Worker thread state ─────────────────────────────────────────────────────
 
 struct FrameJob {
@@ -177,6 +182,15 @@ static cv::Mat makeTFromRvecTvec(const cv::Mat& rvec, const cv::Mat& tvec)
     return T;
 }
 
+static void publishDebug(int width, int height, int matches, int withDepth, int inliers,
+                         int reason, std::vector<VoDebugFeature>& features)
+{
+    std::lock_guard<std::mutex> lock(g_debugMtx);
+    unsigned int frame = g_debugStats.frame + 1;
+    g_debugStats = {width, height, (int)features.size(), matches, withDepth, inliers, reason, frame};
+    g_debugFeatures.swap(features);
+}
+
 // ─── Worker thread ────────────────────────────────────────────────────────────
 
 static void workerLoop()
@@ -233,7 +247,12 @@ static void workerLoop()
         cv::Mat desc;
         orb->detectAndCompute(gray, cv::noArray(), kps, desc);
 
+        std::vector<VoDebugFeature> dbg(kps.size());
+        for (size_t i = 0; i < kps.size(); i++)
+            dbg[i] = {kps[i].pt.x, kps[i].pt.y, 0, 0, VO_FEAT_UNMATCHED};
+
         if (kps.empty() || desc.empty()) {
+            publishDebug(gray.cols, gray.rows, 0, 0, 0, VO_REASON_NO_FEATURES, dbg);
             g_prevGray   = gray;
             g_prevDepthF = depthF;
             g_prevKps    = {};
@@ -250,6 +269,7 @@ static void workerLoop()
             g_prevKps    = kps;
             g_prevDesc   = desc;
             g_status     = 1;
+            publishDebug(gray.cols, gray.rows, 0, 0, 0, VO_REASON_INIT, dbg);
             printf("[VO] frame %d: first frame, map=%d pts\n", frameIdx, g_mapCount);
             continue;
         }
@@ -268,11 +288,14 @@ static void workerLoop()
         // ── Build 3-D (prev frame) → 2-D (current frame) correspondences ─────
         std::vector<cv::Point3f> pts3D;
         std::vector<cv::Point2f> pts2D;
+        std::vector<int> pts3DFeature;      // current-frame feature index per 3-D point
         pts3D.reserve(good.size());
         pts2D.reserve(good.size());
 
         for (auto& m : good) {
             const cv::KeyPoint& kp = g_prevKps[m.queryIdx];
+            VoDebugFeature& f = dbg[m.trainIdx];
+            f.prevX = kp.pt.x; f.prevY = kp.pt.y; f.state = VO_FEAT_NO_DEPTH;
             int px = (int)kp.pt.x;
             int py = (int)kp.pt.y;
             if (px < 0 || py < 0 || px >= g_prevDepthF.cols || py >= g_prevDepthF.rows)
@@ -284,10 +307,14 @@ static void workerLoop()
                              (kp.pt.y - g_cy) * d / g_fy,
                              d});
             pts2D.push_back(kps[m.trainIdx].pt);
+            pts3DFeature.push_back(m.trainIdx);
+            f.state = VO_FEAT_DEPTH;
         }
 
         // ── PnP pose estimation ───────────────────────────────────────────────
         bool poseOk = false;
+        int reason = (int)good.size() < MIN_INLIERS ? VO_REASON_FEW_MATCHES : VO_REASON_FEW_DEPTH;
+        int inlierCount = 0;
         if ((int)pts3D.size() >= MIN_INLIERS) {
             cv::Mat rvec, tvec, inliers;
             // SQPnP is stable on planar scenes (walls, floors) where ITERATIVE's
@@ -302,7 +329,11 @@ static void workerLoop()
                 inliers,
                 cv::SOLVEPNP_SQPNP) && inliers.rows >= MIN_INLIERS;
 
+            reason = ok ? VO_REASON_IMPLAUSIBLE : VO_REASON_PNP_FAILED;
             if (ok) {
+                inlierCount = inliers.rows;
+                for (int i = 0; i < inliers.rows; i++)
+                    dbg[pts3DFeature[inliers.at<int>(i)]].state = VO_FEAT_INLIER;
                 std::vector<cv::Point3f> in3D;
                 std::vector<cv::Point2f> in2D;
                 for (int i = 0; i < inliers.rows; i++) {
@@ -325,6 +356,7 @@ static void workerLoop()
 
                 addFrameToMap(job.color, depthF);
                 poseOk = true;
+                reason = VO_REASON_OK;
                 g_status = 1;
                 g_lostFrames = 0;
 
@@ -332,6 +364,9 @@ static void workerLoop()
                        frameIdx, inliers.rows, (int)good.size(), g_mapCount);
             }
         }
+
+        publishDebug(gray.cols, gray.rows, (int)good.size(), (int)pts3D.size(),
+                     inlierCount, reason, dbg);
 
         if (!poseOk) {
             g_status = 2;
@@ -370,6 +405,11 @@ void voInit(float fx, float fy, float cx, float cy)
         g_cameraRgb.clear();g_trajectory.clear();
         g_mapVoxels.clear();
     }
+    {
+        std::lock_guard<std::mutex> lock(g_debugMtx);
+        g_debugStats = {};
+        g_debugFeatures.clear();
+    }
 
     g_prevGray   = cv::Mat();
     g_prevDepthF = cv::Mat();
@@ -400,6 +440,11 @@ void voStop(void)
     g_mapCount = 0;
     g_camera = {};g_cameraRgb.clear();g_trajectory.clear();
     g_mapVoxels.clear();
+    {
+        std::lock_guard<std::mutex> lock(g_debugMtx);
+        g_debugStats = {};
+        g_debugFeatures.clear();
+    }
     g_status   = 0;
 
     printf("[VO] stopped\n");
@@ -459,6 +504,15 @@ int voGetCameraState(VoCameraState* state, uint8_t* rgb, int capacity,
         std::copy(g_cameraRgb.begin(),g_cameraRgb.end(),rgb);
     int count=std::min(std::max(0,maxVertices),(int)g_trajectory.size()/3);
     if(trajectory && count)std::copy(g_trajectory.end()-count*3,g_trajectory.end(),trajectory);
+    return count;
+}
+
+int voGetDebugFrame(VoDebugStats* stats, VoDebugFeature* features, int maxFeatures)
+{
+    std::lock_guard<std::mutex> lock(g_debugMtx);
+    if (stats) *stats = g_debugStats;
+    int count = std::min(std::max(0, maxFeatures), (int)g_debugFeatures.size());
+    if (features && count) std::copy_n(g_debugFeatures.begin(), count, features);
     return count;
 }
 
