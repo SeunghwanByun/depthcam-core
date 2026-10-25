@@ -51,7 +51,7 @@ typedef struct{
   int dataSize; // 이 메세지의 데이터 크기
   int frameId;  // 프레임 식별자
   uint32_t timestamp; // 타임스템프
-  int ctrlCommand;  // 제어 명령 (MSG_TYPE_CONTROL 에서 사용)
+  int ctrlCommand;  // Control command; data messages: 0=live, >0=playback generation
   char filename[256]; // 파일명 (제어 명령에서 사용)
 }MessageHeader;
 

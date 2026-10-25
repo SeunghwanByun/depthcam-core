@@ -23,6 +23,7 @@ volatile int keepRunning = 1;
 
 // 사용자 명령 처리를 위한 플래그
 static int isMenuMode = 0;
+static int offlinePlayback = 0;
 
 // 종료 과정 상태 추적
 static int shutdownRequested = 0;
@@ -235,7 +236,7 @@ void safeShutdown(){
 
   stopLoggingModule();  // 원래 코드에서는 잘못된 stopSensorModule()을 호출함
 
-  stopSensorModule();
+  if(!offlinePlayback) stopSensorModule();
 
   // 타이머 취소
   timer_delete(shutdownTimerId);
@@ -248,6 +249,13 @@ void safeShutdown(){
 
 int main(int argc, char** argv)
 {
+  const char* playbackPath=NULL;
+  if(argc==3 && strcmp(argv[1],"--playback")==0){
+    playbackPath=argv[2];offlinePlayback=1;
+    if(strlen(playbackPath)>=256 || access(playbackPath,R_OK)!=0){
+      fprintf(stderr,"Playback path must be readable and shorter than 256 bytes\n");return 1;
+    }
+  }else if(argc!=1){fprintf(stderr,"Usage: %s [--playback recording.bin]\n",argv[0]);return 2;}
   printf("Starting Youth\n");
   
   // 종료 시그널 핸들러 등록
@@ -268,6 +276,7 @@ int main(int argc, char** argv)
   usleep(200000); // 0.1초
 
   /* Connect sensor and get sensor data. */
+  if(!offlinePlayback){
   initSensorModule();
 
   // 센서가 실제로 프레임을 받기 시작할 때까지 대기
@@ -279,11 +288,15 @@ int main(int argc, char** argv)
 
   if(!isSensorModuleRunning() || !isSensorModuleReady()) {
     printf("Sensor module failed to become ready: %s\n", getSensorModuleStatus());
-    stopSensorModule();
+    if(!offlinePlayback) stopSensorModule();
     stopLoggingModule();
     cleanupMessageQueues();
     return 1;
   }
+
+  }
+
+  if(playbackPath) setViewerPlaybackFile(playbackPath);
 
   /* Algorithm module. */
   // pthread_t algorithm_thread_id;
@@ -294,7 +307,7 @@ int main(int argc, char** argv)
   usleep(200000);
 
   initViewerModule();
-  setViewerStatusText(getSensorModuleStatus());
+  setViewerStatusText(offlinePlayback?"Offline recording playback":getSensorModuleStatus());
 
   // 종료 콜백 설정
   setExitCallback(exitHandler);
@@ -303,10 +316,12 @@ int main(int argc, char** argv)
   usleep(500000); // 0.5초
   if(!isViewerModuleRunning()) {
     printf("Viewer module failed to initialize! Exiting...\n");
-    stopSensorModule();
+    if(!offlinePlayback) stopSensorModule();
     stopLoggingModule();
     return 1;
   }
+
+  if(playbackPath) startPlayback(playbackPath);
 
   printf("All modules initialized. Press Enter to show menu.\n");
 
@@ -318,7 +333,7 @@ int main(int argc, char** argv)
   // 프로그램이 종료될 때까지 대기
   // printf("Application running. Press Ctrl+C or close the window to exit.\n");
   while(keepRunning){
-    setViewerStatusText(getSensorModuleStatus());
+    setViewerStatusText(offlinePlayback?"Offline recording playback":getSensorModuleStatus());
 
     // 사용자 입력 처리 설정
     FD_ZERO(&readfds);
@@ -342,7 +357,7 @@ int main(int argc, char** argv)
       keepRunning = 0;
     }
 
-    if(!isSensorModuleRunning()){
+    if(!offlinePlayback && !isSensorModuleRunning()){
       printf("Sensor module stopped unexpectedly! %s\n", getSensorModuleStatus());
       keepRunning = 0;
     }

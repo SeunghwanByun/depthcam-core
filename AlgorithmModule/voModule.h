@@ -36,6 +36,11 @@ int voGetTrackingStatus(void);
 // Number of frames processed so far.
 int voGetFrameCount(void);
 
+// Wait until all submitted frames finish. Call from a single producer.
+void voWaitIdle(void);
+// Save current map as ASCII PLY; returns 1 on success.
+int voSaveMap(const char* filename);
+
 // Reset accumulated map and restart tracking from scratch.
 void voReset(void);
 

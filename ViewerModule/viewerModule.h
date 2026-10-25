@@ -9,6 +9,8 @@ typedef void (*ExitCallbackFunc)(void);
 void setExitCallback(ExitCallbackFunc callback);
 void setViewerStatusText(const char* text);
 
+// Set before initialization; P replays this file without needing a new recording.
+void setViewerPlaybackFile(const char* path);
 void initViewerModule();
 void stopViewerModule();
 void* viewerModule(void* id);

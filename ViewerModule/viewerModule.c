@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "viewerModule.h"
+#include "../LoggingModule/loggingModule.h"
 #include "../frameDefinitions.h"
 #include "../AlgorithmModule/voModule.h"
 #ifdef YOUTH_ZMQ_ENABLED
@@ -71,6 +72,10 @@ static char viewerStatusText[256] = "Waiting for sensor";
 static int viewerIsRecording = 0;
 static int viewerIsPlayback = 0;
 static char lastRecordedFilename[256] = "";
+static int lastPlaybackGeneration=0;
+void setViewerPlaybackFile(const char* path){
+  snprintf(lastRecordedFilename,sizeof(lastRecordedFilename),"%s",path?path:"");
+}
 
 // VO state tracked in viewer
 static atomic_int viewerVoActive = 0;  // 0 = off, 1 = on
@@ -361,7 +366,7 @@ void* dataReceiveThread(void* arg){
 
       pthread_mutex_lock(&dataMutex);
 
-      if(receiveStatus.totalDepthChunks > 0 && receiveStatus.totalColorChunks > 0 &&
+      if(!receiveStatus.isComplete && receiveStatus.totalDepthChunks > 0 && receiveStatus.totalColorChunks > 0 &&
          receiveStatus.receivedDepthChunks == receiveStatus.totalDepthChunks &&
          receiveStatus.receivedColorChunks == receiveStatus.totalColorChunks){
 
@@ -392,10 +397,19 @@ void* dataReceiveThread(void* arg){
           hasNewData = 1;
           inputFrames++;
 
-          // Feed frame to VO worker (non-blocking drop if queue full)
+          // Playback generation tags prevent mixing a replay with the previous map.
+          if(header->ctrlCommand>0 && header->ctrlCommand!=lastPlaybackGeneration){
+            if(voIsRunning()) voStop();
+            voInit(570.3f*currentWidth/640,570.3f*currentHeight/480,currentWidth*.5f,currentHeight*.5f);
+            viewerVoActive=1;
+            s_voDisplayCount=0;s_voLastSyncCount=0;
+            lastPlaybackGeneration=header->ctrlCommand;
+          }
+          // Offline replay processes every frame; live input may drop to stay responsive.
           if(viewerVoActive && voIsRunning()){
             voProcessFrame(depthDataBuffer, colorDataBuffer,
                            currentWidth, currentHeight, receiveStatus.timestamp);
+            if(header->ctrlCommand>0) voWaitIdle();
           }
 
 #ifdef YOUTH_ZMQ_ENABLED
@@ -471,12 +485,18 @@ static void panelRect(float x, float y, float w, float h){
 static void drawHUD(void){
   overlayProjection();
   int half = windowWidth / 2;
+  RecordingStatus rec;
+  getRecordingStatus(&rec);
+  viewerIsRecording = rec.active;
+  PlaybackStatus playback;
+  getPlaybackStatus(&playback);
+  viewerIsPlayback=playback.state==1;
   glColor3f(.09f,.12f,.17f);
   panelRect(0,windowHeight-84,windowWidth,84);
   panelRect(0,0,windowWidth,56);
   glColor3f(.22f,.29f,.36f); panelRect(half-1,56,2,windowHeight-140);
   glColor3f(.3f,.85f,.85f);
-  drawBitmapString(20,windowHeight-30,GLUT_BITMAP_HELVETICA_18,"LIVE INPUT");
+  drawBitmapString(20,windowHeight-30,GLUT_BITMAP_HELVETICA_18,playback.state?"RECORDED INPUT":"LIVE INPUT");
   drawBitmapString(half+20,windowHeight-30,GLUT_BITMAP_HELVETICA_18,"SLAM WORKSPACE");
   char text[256];
   pthread_mutex_lock(&dataMutex);
@@ -503,13 +523,28 @@ static void drawHUD(void){
     drawBitmapString(half+30,windowHeight/2-10,GLUT_BITMAP_HELVETICA_12,"Map results will appear here. V: experimental VO preview");
   }
   glColor3f(.75f,.8f,.86f);
-  drawBitmapString(18,34,GLUT_BITMAP_HELVETICA_12,"1:RGB  2:Depth  R:Record  P:Playback  S:Stop  ESC:Quit");
+  drawBitmapString(18,34,GLUT_BITMAP_HELVETICA_12,"1:RGB  2:Depth  R:Record  P:Replay  S:Stop  M:Save map  ESC:Quit");
   drawBitmapString(half+18,34,GLUT_BITMAP_HELVETICA_12,"V:VO  X:Reset  Left:Pan  Right:Rotate  Wheel:Zoom");
-  pthread_mutex_lock(&viewerStatusMutex);
-  drawBitmapString(18,14,GLUT_BITMAP_HELVETICA_12,viewerStatusText);
-  pthread_mutex_unlock(&viewerStatusMutex);
-  glColor3f(viewerIsRecording?1:.4f,viewerIsRecording?.3f:.8f,.4f);
-  drawBitmapString(half+18,14,GLUT_BITMAP_HELVETICA_12,viewerIsRecording?"RECORDING":viewerIsPlayback?"PLAYBACK":"LIVE");
+  glColor3f(rec.writeError?1:.3f,rec.writeError?.3f:.85f,.4f);
+  snprintf(text,sizeof(text),"%s | Saved: %u frames | %.1f MiB",
+    rec.writeError?"RECORDING ERROR":rec.active?"REC":rec.path[0]?"SAVED":"LIVE",
+    rec.frames,(double)rec.bytes/(1024*1024));
+  if(playback.state && !rec.active){
+    const char* state=playback.state==1?"PLAYBACK + VO":playback.state==2?"PLAYBACK COMPLETE":playback.state==3?"PLAYBACK STOPPED":"PLAYBACK ERROR";
+    snprintf(text,sizeof(text),"%s | Sent: %u | VO: %d frames",state,playback.frames,voGetFrameCount());
+  }
+  drawBitmapString(18,14,GLUT_BITMAP_HELVETICA_12,text);
+  glColor3f(.75f,.8f,.86f);
+  const char* path=playback.state?playback.path:rec.path[0]?rec.path:"R: start recording to current working directory";
+  // Keep the filename visible even when the absolute path exceeds panel width.
+  size_t maxChars=(size_t)((half-36)/8);
+  size_t length=strlen(path);
+  if(length>maxChars && maxChars>3){
+    snprintf(text,sizeof(text),"...%s",path+length-(maxChars-3));
+    path=text;
+  }
+  drawBitmapString(half+18,14,GLUT_BITMAP_HELVETICA_12,path);
+
 }
 
 void display_3d_color(void){
@@ -570,6 +605,7 @@ void display_3d_color(void){
     glVertex3f(-5,-1,i*.5f);glVertex3f(5,-1,i*.5f);
   }
   glEnd();
+  pthread_mutex_lock(&dataMutex);
   if(viewerVoActive && voIsRunning()){
     int currentMapCount = voGetMapPointCount();
     if(currentMapCount != s_voLastSyncCount && currentMapCount > 0){
@@ -593,6 +629,7 @@ void display_3d_color(void){
     }
   }
 
+  pthread_mutex_unlock(&dataMutex);
   pthread_mutex_lock(&resultMutex);
   if(resultAvailable){
     glEnableClientState(GL_VERTEX_ARRAY); glEnableClientState(GL_COLOR_ARRAY);
@@ -644,6 +681,8 @@ void key_callback(GLFWwindow* win, int key, int scancode, int action, int mods)
 
   // R: start recording (auto timestamped filename)
   if(key == GLFW_KEY_R && action == GLFW_PRESS){
+    PlaybackStatus pb;getPlaybackStatus(&pb);
+    if(pb.state){printf("Restart without --playback to record live input.\n");return;}
     if(!viewerIsRecording && !viewerIsPlayback){
       time_t t = time(NULL);
       struct tm* tm_info = localtime(&t);
@@ -662,6 +701,9 @@ void key_callback(GLFWwindow* win, int key, int scancode, int action, int mods)
   // P: start playback of last recorded file
   if(key == GLFW_KEY_P && action == GLFW_PRESS){
     if(!viewerIsPlayback && !viewerIsRecording){
+      RecordingStatus rec;getRecordingStatus(&rec);
+      if(rec.path[0] && strlen(rec.path)<sizeof(lastRecordedFilename))
+        snprintf(lastRecordedFilename,sizeof(lastRecordedFilename),"%s",rec.path);
       if(lastRecordedFilename[0] != '\0'){
         viewerSendControlCommand(CTRL_CMD_START_PLAYBACK, lastRecordedFilename);
         viewerIsPlayback = 1;
@@ -690,8 +732,20 @@ void key_callback(GLFWwindow* win, int key, int scancode, int action, int mods)
     }
   }
 
+  if(key == GLFW_KEY_M && action == GLFW_PRESS){
+    PlaybackStatus pb;getPlaybackStatus(&pb);
+    char out[320];
+    snprintf(out,sizeof(out),"%s.ply",pb.path[0]?pb.path:"vo-map");
+    pthread_mutex_lock(&dataMutex);
+    int saved=voIsRunning() && voSaveMap(out);
+    pthread_mutex_unlock(&dataMutex);
+    setViewerStatusText(saved?"VO map saved as PLY":"Map save failed or VO inactive");
+    printf("Map export %s: %s\n",saved?"saved":"failed",out);
+  }
+
   // V: toggle Visual Odometry on / off
   if(key == GLFW_KEY_V && action == GLFW_PRESS){
+    pthread_mutex_lock(&dataMutex);
     if(!viewerVoActive){
       // Astra camera intrinsics
       voInit(570.3f, 570.3f, 320.0f, 240.0f);
@@ -706,16 +760,20 @@ void key_callback(GLFWwindow* win, int key, int scancode, int action, int mods)
       s_voLastSyncCount = 0;
       printf("VO stopped\n");
     }
+
+    pthread_mutex_unlock(&dataMutex);
   }
 
   // X: reset VO map (keep VO running but clear accumulated points)
   if(key == GLFW_KEY_X && action == GLFW_PRESS){
+    pthread_mutex_lock(&dataMutex);
     if(viewerVoActive && voIsRunning()){
       voReset();
       s_voDisplayCount  = 0;
       s_voLastSyncCount = 0;
       printf("VO map reset\n");
     }
+    pthread_mutex_unlock(&dataMutex);
   }
 }
 
