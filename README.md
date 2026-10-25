@@ -57,3 +57,49 @@ vertices; invalid sizes are rejected. Empty arrays with a null status clear
 the result. Stop the experimental VO preview before connecting another backend.
 Camera calibration, RGB/depth registration and a complete SLAM backend are
 not implemented by this viewer change.
+
+Recording feedback: the footer shows `REC | Saved: N frames | MiB` and the
+recording path (long paths are shortened visually). The count advances after
+successful frame writes and `fflush`; this is not an `fsync` durability guarantee.
+`S` stops recording and retains the final count. File-open/write errors appear as
+`RECORDING ERROR`. Viewer `R` saves `recording_YYYYMMDD_HHMMSS.bin` in the process
+working directory. Terminal-selected recordings also update this footer.
+
+## Replay a recording and build a VO map
+
+From the repository root (no camera required):
+
+```bash
+./build/Youth --playback recording_20261025_163209.bin
+```
+
+The left panel replays the recorded RGB/Depth; VO starts automatically and the
+right panel accumulates its map. The footer shows replay frames and completed
+VO frames. Playback uses recorded millisecond intervals (gaps over one second
+are capped); processing can make playback slower than real time. Replay waits
+for VO processing instead of dropping frames. At EOF, the final image and map
+remain on screen. `P` restarts the selected file with a fresh map, `S` stops
+playback and retains the map, `M` exports it to `<recording path>.ply`, and `Esc`
+exits. Restart without `--playback` to return to live camera capture.
+
+A recording selected using terminal menu option `3`, or the viewer's `P` key,
+also starts VO when its first complete frame arrives. `V` can disable/re-enable
+VO. Playback and live camera frames are kept separate.
+
+To process a whole recording without opening a viewer:
+
+```bash
+./build/recording_to_map recording_20261025_163209.bin build/output/recording_20261025_163209.ply
+```
+
+This validates the frame sizes and EOF marker, processes every frame, and writes
+an ASCII PLY with XYZ in metres and RGB colours. The summary reports frame count,
+map points, all-zero depth frames, and tracking-lost frames. The current VO uses
+approximate Astra intrinsics (scaled from 640x480), stores at most 1,000,000 map
+points, and displays up to 300,000 sampled points. It is not full SLAM: sparse
+texture, motion blur and tracking loss can produce incomplete or inaccurate
+maps; there is no loop closure or global drift correction. Recordings and map
+artifacts are local and excluded from Git.
+
+Validation: `python3 tests/test_recording_to_map.py` checks blank-frame handling
+and rejects truncated, mismatched-size, missing-EOF and trailing-data recordings.

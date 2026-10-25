@@ -12,13 +12,14 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <time.h>
+#include <stdatomic.h>
 #include <sys/time.h>
 
 // 스레드 제어 변수
-static int loggingIsRunning = 1;
+static atomic_int loggingIsRunning = 1;
 static int isRecordingData = 0;
-static int isPlaybackActive = 0;
-static int isPassThroughEnabled = 1; // 기본적으로 패스스루 활성화
+static atomic_int isPlaybackActive = 0;
+static atomic_int isPassThroughEnabled = 1; // 기본적으로 패스스루 활성화
 uint32_t playbackFrameCounter = 0;
 
 
@@ -42,9 +43,26 @@ static pthread_mutex_t playbackMutex = PTHREAD_MUTEX_INITIALIZER;
 // 파일명 저장 변수
 static char currentRecordFilename[256];
 static char currentPlaybackFilename[256];
+static PlaybackStatus playbackStatus={0};
+static int playbackGeneration=0;
+void getPlaybackStatus(PlaybackStatus* status){
+  if(!status) return;
+  pthread_mutex_lock(&playbackMutex);
+  *status=playbackStatus;
+  pthread_mutex_unlock(&playbackMutex);
+}
+
 
 // 프레임 카운터
 static uint32_t frameCounter = 0;
+static RecordingStatus recordingStatus = {0};
+
+void getRecordingStatus(RecordingStatus* status){
+  if(!status) return;
+  pthread_mutex_lock(&recordMutex);
+  *status = recordingStatus;
+  pthread_mutex_unlock(&recordMutex);
+}
 
 // 기타 상태 변수
 static int receivedDepthFrame = 0;
@@ -78,6 +96,7 @@ static void closeRecordFileLocked(void){
     recordFile = NULL;
   }
   isRecordingData = 0;
+  recordingStatus.active = 0;
 }
 
 static int ensurePlaybackBuffer(char** buffer, size_t* capacity, size_t requiredSize){
@@ -150,17 +169,20 @@ static void saveFrameToFile(int frameId, uint32_t timestamp){
   header.colorDataSize = currentWidth * currentHeight * 3 * sizeof(uint8_t);
   header.reserved = 0;
 
-  // 헤더 쓰기
-  fwrite(&header, sizeof(FrameHeader), 1, recordFile);
-
-  // 깊이 데이터 쓰기
-  fwrite(depthBuffer, header.depthDataSize, 1, recordFile);
-
-  // 색상 데이터 쓰기
-  fwrite(colorBuffer, header.colorDataSize, 1, recordFile);
-
-  // 파일 버퍼 플러시
-  fflush(recordFile);
+  if(fwrite(&header, sizeof(header), 1, recordFile) == 1 &&
+     fwrite(depthBuffer, header.depthDataSize, 1, recordFile) == 1 &&
+     fwrite(colorBuffer, header.colorDataSize, 1, recordFile) == 1 &&
+     fflush(recordFile) == 0){
+    recordingStatus.frames = ++frameCounter;
+    recordingStatus.bytes += sizeof(header) + header.depthDataSize + header.colorDataSize;
+  }else{
+    perror("Recording write failed");
+    recordingStatus.writeError = 1;
+    fclose(recordFile);
+    recordFile = NULL;
+    isRecordingData = 0;
+    recordingStatus.active = 0;
+  }
 
   pthread_mutex_unlock(&recordMutex);
 }
@@ -238,12 +260,21 @@ static void* loggerThread(void* arg){
               strncpy(currentRecordFilename, header->filename, sizeof(currentRecordFilename) -1);
               currentRecordFilename[sizeof(currentRecordFilename) - 1] = '\0';
 
+              memset(&recordingStatus, 0, sizeof(recordingStatus));
+              snprintf(recordingStatus.path, sizeof(recordingStatus.path), "%s", currentRecordFilename);
               recordFile = fopen(currentRecordFilename, "wb");
               if(recordFile){
                 isRecordingData = 1;
                 frameCounter = 0;
+                recordingStatus.active = 1;
+                char* absolutePath = realpath(currentRecordFilename, NULL);
+                if(absolutePath){
+                  snprintf(recordingStatus.path, sizeof(recordingStatus.path), "%s", absolutePath);
+                  free(absolutePath);
+                }
                 printf("Started recording to: %s\n", currentRecordFilename);
               }else{
+                recordingStatus.writeError = 1;
                 perror("Failed to open record file");
               }
 
@@ -266,6 +297,11 @@ static void* loggerThread(void* arg){
 
             // 플레이백 시작 명령 처리
             pthread_mutex_lock(&playbackMutex);
+            if(playbackFile){fclose(playbackFile);playbackFile=NULL;}
+            playbackGeneration++;
+            playbackStatus.state=1;
+            playbackStatus.frames=0;
+            snprintf(playbackStatus.path,sizeof(playbackStatus.path),"%s",header->filename);
             strncpy(currentPlaybackFilename, header->filename, sizeof(currentPlaybackFilename) - 1);
             currentPlaybackFilename[sizeof(currentPlaybackFilename) - 1] = '\0';
 
@@ -293,7 +329,8 @@ static void* loggerThread(void* arg){
             }
 
             // 패스스루 다시 활성화
-            isPassThroughEnabled = 1;
+            isPassThroughEnabled = 0; // Freeze the completed map until explicitly returning live.
+            playbackStatus.state = 3;
 
             printf("Playback stopped\n");
             pthread_mutex_unlock(&playbackMutex);
@@ -385,7 +422,8 @@ static void* loggerThread(void* arg){
       // 깊이 및 색상 데이터가 모두 수신되면 프레임 저장 (녹화 모드인 경우)
       if(receivedDepthFrame && receivedColorFrame && isRecordingData){
         saveFrameToFile(header->frameId, header->timestamp);
-        frameCounter++;
+        receivedDepthFrame = 0;
+        receivedColorFrame = 0;
       }
     }else if(errno != ETIMEDOUT && errno != EINTR){
       perror("mq_timedreceive from sensor");
@@ -449,11 +487,14 @@ static int readFrameFromFile(FILE* file, FrameHeader* header,
   // 종료 마커 확인
   if(header->frameType == FRAME_TYPE_END_OF_FILE){
     printf("End of file marker found\n");
-    return 0;
+    return 2;
   }
 
   if(header->width == 0 || header->height == 0 ||
-     header->depthDataSize == 0 || header->colorDataSize == 0){
+     header->frameType != FRAME_TYPE_DEPTH_COLOR ||
+     (uint64_t)header->width*header->height > 4096ULL*4096 ||
+     header->depthDataSize != (uint64_t)header->width*header->height*2 ||
+     header->colorDataSize != (uint64_t)header->width*header->height*3){
     printf("Invalid frame header: width=%u, height=%u, depth=%u, color=%u\n",
            header->width, header->height, header->depthDataSize, header->colorDataSize);
     return 0;
@@ -482,12 +523,12 @@ static int readFrameFromFile(FILE* file, FrameHeader* header,
 }
 
 // 청크로 나누어 데이터 전송
-static void sendDataInChunks(mqd_t mqdes, int msgType, int frameId, uint32_t timestamp, int width, int height, const char* data, int dataSize){
+static int sendDataInChunks(mqd_t mqdes, int msgType, int frameId, uint32_t timestamp, int width, int height, const char* data, int dataSize){
 
   char* msgBuffer = (char*)malloc(MAX_MSG_SIZE);
   if(!msgBuffer){
     perror("malloc chunk buffer");
-    return;
+    return 0;
   }
 
   int maxDataPerMsg = MAX_MSG_SIZE - sizeof(MessageHeader);
@@ -495,6 +536,8 @@ static void sendDataInChunks(mqd_t mqdes, int msgType, int frameId, uint32_t tim
 
   for(int i = 0; i < totalChunks; i++){
     MessageHeader* header = (MessageHeader*)msgBuffer;
+    memset(header,0,sizeof(*header));
+    header->ctrlCommand=playbackGeneration;
     header->msgType = msgType;
     header->width = width;
     header->height = height;
@@ -512,19 +555,24 @@ static void sendDataInChunks(mqd_t mqdes, int msgType, int frameId, uint32_t tim
     memcpy(msgBuffer + sizeof(MessageHeader), data + offset, chunkSize);
 
     // 전송
-    if(mq_send(mqdes, msgBuffer, sizeof(MessageHeader) + chunkSize, 0) == -1){
+    struct timespec deadline;
+    setTimeoutFromNow(&deadline, 5000);
+    if(!loggingIsRunning || mq_timedsend(mqdes, msgBuffer, sizeof(MessageHeader)+chunkSize, 0, &deadline) == -1){
 
       perror("mq_send chunk");
-      break;
+      free(msgBuffer);
+      return 0;
     }
   }
 
   free(msgBuffer);
+  return 1;
 }
 
 // 메타 데이터 전송
-static void sendMetadata(mqd_t mqdes, int frameId, uint32_t timestamp, int width, int height){
-  MessageHeader header;
+static int sendMetadata(mqd_t mqdes, int frameId, uint32_t timestamp, int width, int height){
+  MessageHeader header={0};
+  header.ctrlCommand=playbackGeneration;
   header.msgType = MSG_TYPE_METADATA;
   header.width = width;
   header.height = height;
@@ -534,9 +582,13 @@ static void sendMetadata(mqd_t mqdes, int frameId, uint32_t timestamp, int width
   header.frameId = frameId;
   header.timestamp = timestamp;
 
-  if(mq_send(mqdes, (char*)&header, sizeof(MessageHeader), 0) == -1){
+  struct timespec deadline;
+  setTimeoutFromNow(&deadline,5000);
+  if(mq_timedsend(mqdes, (char*)&header, sizeof(MessageHeader), 0, &deadline) == -1){
     perror("mq_send metadata");
+    return 0;
   }
+  return 1;
 }
 
 // 재생 스레드 함수
@@ -564,60 +616,45 @@ static void* playbackThread(void* arg){
   size_t playbackDepthCapacity = 0;
   size_t playbackColorCapacity = 0;
 
+  uint32_t previousTimestamp=0;
+  int lastGeneration=-1;
   while(loggingIsRunning){
-    // 플레이백 모드가 아니면 대기
-    if(!isPlaybackActive){
-      // printf("Playback is Not Activated!\n");
-      usleep(100000); // 100ms 대기
-      continue;
-    }
-
+    if(!isPlaybackActive){usleep(10000);continue;}
     pthread_mutex_lock(&playbackMutex);
-
-    // 파일 열기
+    if(!isPlaybackActive){pthread_mutex_unlock(&playbackMutex);continue;}
     if(!playbackFile){
-      playbackFile = fopen(currentPlaybackFilename, "rb");
+      playbackFile=fopen(currentPlaybackFilename,"rb");
       if(!playbackFile){
-        perror("Failed to open playback file");
-        isPlaybackActive = 0;
-        pthread_mutex_unlock(&playbackMutex);
-        continue;
+        perror("Playback open failed"); playbackStatus.state=4;isPlaybackActive=0;
+        pthread_mutex_unlock(&playbackMutex);continue;
       }
-
-      printf("Started playback from: %s\n", currentPlaybackFilename);
     }
-
-    // 프레임 읽기
     FrameHeader header;
-    if(!readFrameFromFile(playbackFile, &header,
-                          &playbackDepthBuffer, &playbackDepthCapacity,
-                          &playbackColorBuffer, &playbackColorCapacity)){
-      // 파일 끝이거나 오류 발생
-      fclose(playbackFile);
-      playbackFile = NULL;
-      isPlaybackActive = 0;
-      printf("Playback completed or error occurred. Total frames played: %u\n", playbackFrameCounter);
-      pthread_mutex_unlock(&playbackMutex);
-      continue;
+    int readStatus=readFrameFromFile(playbackFile,&header,
+      &playbackDepthBuffer,&playbackDepthCapacity,&playbackColorBuffer,&playbackColorCapacity);
+    if(readStatus!=1){
+      fclose(playbackFile);playbackFile=NULL;isPlaybackActive=0;
+      playbackStatus.state=readStatus==2?2:4;
+      printf("Playback %s: %u frames. Map retained.\n",readStatus==2?"completed":"error",playbackStatus.frames);
+      pthread_mutex_unlock(&playbackMutex);continue;
     }
-
-    // 프레임 카운터 증가 및 출력
-    playbackFrameCounter++;
-    printf("Playing frame #%u (ID: %u, timestamp: %u)\n", playbackFrameCounter, header.frameId, header.timestamp);
-
+    int generation=playbackGeneration;
+    uint32_t delay=lastGeneration==generation ? header.timestamp-previousTimestamp : 0;
+    previousTimestamp=header.timestamp;lastGeneration=generation;
     pthread_mutex_unlock(&playbackMutex);
-
-    // 메타데이터 전송
-    sendMetadata(mqPlaybackToViewer, header.frameId, header.timestamp, header.width, header.height);
-
-    // 깊이 데이터 전송
-    sendDataInChunks(mqPlaybackToViewer, MSG_TYPE_DEPTH_DATA, header.frameId, header.timestamp, header.width, header.height, playbackDepthBuffer, header.depthDataSize);
-
-    // 색상 데이터 전송
-    sendDataInChunks(mqPlaybackToViewer, MSG_TYPE_COLOR_DATA, header.frameId, header.timestamp, header.width, header.height, playbackColorBuffer, header.colorDataSize);
-
-    // 프레임 레이트 조절 (30fps, 약 33ms)
-    usleep(33333);
+    // Timestamp pacing; cap long acquisition gaps at one second.
+    if(delay>1000)delay=1000;
+    while(delay && loggingIsRunning && isPlaybackActive){
+      unsigned step=delay>10?10:delay;usleep(step*1000);delay-=step;
+    }
+    pthread_mutex_lock(&playbackMutex);
+    if(!isPlaybackActive || generation!=playbackGeneration){pthread_mutex_unlock(&playbackMutex);continue;}
+    int sent=sendMetadata(mqPlaybackToViewer,header.frameId,header.timestamp,header.width,header.height) &&
+      sendDataInChunks(mqPlaybackToViewer,MSG_TYPE_DEPTH_DATA,header.frameId,header.timestamp,header.width,header.height,playbackDepthBuffer,header.depthDataSize) &&
+      sendDataInChunks(mqPlaybackToViewer,MSG_TYPE_COLOR_DATA,header.frameId,header.timestamp,header.width,header.height,playbackColorBuffer,header.colorDataSize);
+    if(sent){playbackStatus.frames=++playbackFrameCounter;}
+    else {playbackStatus.state=4;isPlaybackActive=0;fclose(playbackFile);playbackFile=NULL;}
+    pthread_mutex_unlock(&playbackMutex);
   }
 
   // 정리

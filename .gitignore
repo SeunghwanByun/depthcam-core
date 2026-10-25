@@ -1,3 +1,8 @@
 build/
 build_t/
 build-youth-source/
+
+# Local camera recordings, reconstructed maps and SDK runtime logs.
+recording_*.bin
+*.ply
+astra.log

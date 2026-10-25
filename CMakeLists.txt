@@ -46,3 +46,7 @@ target_link_libraries(Youth
     pthread
     rt
 )
+
+# Offline RGB-D mapping without a camera or display.
+add_executable(recording_to_map tools/recording_to_map.cpp)
+target_link_libraries(recording_to_map AlgorithmModuleLib pthread)

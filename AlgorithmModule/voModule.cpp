@@ -10,6 +10,8 @@
 #include <thread>
 #include <algorithm>
 #include <cstdio>
+#include <fstream>
+#include <condition_variable>
 
 // ─── Tuning constants ────────────────────────────────────────────────────────
 
@@ -46,6 +48,8 @@ struct FrameJob {
 
 static std::queue<FrameJob> g_jobQueue;
 static std::mutex           g_queueMtx;
+static std::condition_variable g_idle;
+static bool g_busy = false;
 static std::thread          g_worker;
 static std::atomic<bool>    g_running{false};
 
@@ -144,9 +148,19 @@ static void workerLoop()
             }
             job = std::move(g_jobQueue.front());
             g_jobQueue.pop();
+            g_busy = true;
         }
 
-        int frameIdx = ++g_frameCount;
+        // Every exit path (including early continue) signals completed processing.
+        struct Completion {
+            ~Completion(){
+                std::lock_guard<std::mutex> lock(g_queueMtx);
+                g_busy = false;
+                ++g_frameCount;
+                g_idle.notify_all();
+            }
+        } completion;
+        int frameIdx = g_frameCount + 1;
 
         // ── Preprocess ───────────────────────────────────────────────────────
         cv::Mat depthF;
@@ -170,7 +184,7 @@ static void workerLoop()
         }
 
         // ── First frame — initialise ──────────────────────────────────────────
-        if (g_prevGray.empty()) {
+        if (g_prevGray.empty() || g_prevDesc.empty()) {
             addFrameToMap(job.color, depthF);
             g_prevGray   = gray;
             g_prevDepthF = depthF;
@@ -294,6 +308,7 @@ void voStop(void)
     std::lock_guard<std::mutex> lk(g_queueMtx);
     while (!g_jobQueue.empty()) g_jobQueue.pop();
 
+    std::lock_guard<std::mutex> mapLock(g_mapMtx);
     delete[] g_mapBuf;
     g_mapBuf   = nullptr;
     g_mapCount = 0;
@@ -338,8 +353,13 @@ int voGetMapPoints(float* dst, int max_points)
 {
     std::lock_guard<std::mutex> lk(g_mapMtx);
     int n = std::min(g_mapCount, max_points);
-    if (n > 0 && g_mapBuf)
-        std::memcpy(dst, g_mapBuf, (size_t)n * 6 * sizeof(float));
+    if (n > 0 && g_mapBuf && dst){
+        // Sample across the full map when the viewer's display budget is smaller.
+        for(int i=0;i<n;i++){
+            size_t source=(size_t)i*g_mapCount/n;
+            std::memcpy(dst+i*6,g_mapBuf+source*6,6*sizeof(float));
+        }
+    }
     return n;
 }
 
@@ -363,26 +383,32 @@ void voReset(void)
 {
     if (!g_running) return;
 
-    // Clear the queue
-    {
-        std::lock_guard<std::mutex> lk(g_queueMtx);
-        while (!g_jobQueue.empty()) g_jobQueue.pop();
-    }
-
-    // Reset VO state (safe: worker checks g_running and idles between jobs)
-    {
-        std::lock_guard<std::mutex> lk(g_mapMtx);
-        g_mapCount = 0;
-        if (g_mapBuf) std::memset(g_mapBuf, 0, (size_t)MAX_MAP_POINTS * 6 * sizeof(float));
-    }
-
-    g_prevGray   = cv::Mat();
-    g_prevDepthF = cv::Mat();
-    g_prevKps.clear();
-    g_prevDesc   = cv::Mat();
-    g_T_w_c      = cv::Mat::eye(4, 4, CV_64F);
-    g_frameCount = 0;
-    g_status     = 0;
-
+    // Join before touching worker-owned tracking state.
+    float fx=g_fx, fy=g_fy, cx=g_cx, cy=g_cy;
+    voStop();
+    voInit(fx, fy, cx, cy);
     printf("[VO] reset\n");
+}
+
+void voWaitIdle(void){
+    std::unique_lock<std::mutex> lock(g_queueMtx);
+    g_idle.wait(lock, []{ return g_jobQueue.empty() && !g_busy; });
+}
+
+int voSaveMap(const char* filename){
+    std::lock_guard<std::mutex> lock(g_mapMtx);
+    std::ofstream out(filename);
+    if(!out) return 0;
+    out << "ply\nformat ascii 1.0\ncomment VO point cloud, metres, viewer coordinates\n"
+        << "element vertex " << g_mapCount
+        << "\nproperty float x\nproperty float y\nproperty float z\n"
+        << "property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n";
+    for(int i=0;i<g_mapCount;i++){
+        const float* p=g_mapBuf+i*6;
+        out << p[0] << ' ' << p[1] << ' ' << p[2];
+        for(int c=3;c<6;c++) out << ' ' << (int)std::max(0.f,std::min(255.f,p[c]*255));
+        out << '\n';
+    }
+    out.close();
+    return !out.fail();
 }
