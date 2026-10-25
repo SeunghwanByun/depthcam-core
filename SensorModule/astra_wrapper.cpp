@@ -4,6 +4,8 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <chrono>
+#include <thread>
 
 #if defined(USE_ASTRA_SDK)
 #include <astra/astra.hpp>
@@ -35,6 +37,10 @@ struct AstraContext {
 #if defined(USE_ASTRA_SDK)
     astra::StreamSet* streamSet;
     astra::StreamReader* reader;
+    std::vector<int16_t> depthBuffer;
+    std::vector<uint8_t> colorBuffer;
+    int frameWidth = 0;
+    int frameHeight = 0;
 #elif defined(USE_OPENNI2)
     openni::Device device;
     openni::VideoStream depthStream;
@@ -161,19 +167,28 @@ void TerminateAstraObj(AstraContext_t* context)
 const int16_t* GetDepthDataAstraOpenGL(AstraContext_t* context, int* width, int* height)
 {
 #if defined(USE_ASTRA_SDK)
-    astra_update();
-    astra::Frame frame = context->reader->get_latest_frame(ASTRA_TIMEOUT_RETURN_IMMEDIATELY);
-    auto depthFrame = frame.get<astra::DepthFrame>();
-
-    if (depthFrame.is_valid())
-    {
-        *width = depthFrame.width();
-        *height = depthFrame.height();
-        return depthFrame.data();
-    }else{
-        setLastError("Get Depth Frame Failed");
-        std::cout << "Get Depth Frame Failed...!" << std::endl;
+    // Acquire once for both streams and retain owned copies after Frame expires.
+    context->colorBuffer.clear();
+    for (int attempt = 0; attempt < 50; ++attempt) {
+        astra_update();
+        auto frame = context->reader->get_latest_frame(ASTRA_TIMEOUT_RETURN_IMMEDIATELY);
+        auto depthFrame = frame.get<astra::DepthFrame>();
+        auto colorFrame = frame.get<astra::ColorFrame>();
+        if (depthFrame.is_valid() && colorFrame.is_valid() &&
+            depthFrame.width() == colorFrame.width() &&
+            depthFrame.height() == colorFrame.height()) {
+            *width = context->frameWidth = depthFrame.width();
+            *height = context->frameHeight = depthFrame.height();
+            const size_t pixels = static_cast<size_t>(*width) * *height;
+            context->depthBuffer.assign(depthFrame.data(), depthFrame.data() + pixels);
+            const auto* rgb = reinterpret_cast<const uint8_t*>(colorFrame.data());
+            context->colorBuffer.assign(rgb, rgb + pixels * 3);
+            setLastError("");
+            return context->depthBuffer.data();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+    setLastError("Timed out waiting for matching depth and color frames");
     return NULL;
 #else
     openni::VideoFrameRef frame;
@@ -195,22 +210,10 @@ const int16_t* GetDepthDataAstraOpenGL(AstraContext_t* context, int* width, int*
 const uint8_t* GetColorDataAstraOpenGL(AstraContext_t* context, int* width, int* height)
 {
 #if defined(USE_ASTRA_SDK)
-    astra::Frame frame = context->reader->get_latest_frame(ASTRA_TIMEOUT_RETURN_IMMEDIATELY);
-    auto colorFrame = frame.get<astra::ColorFrame>();
-
-    if (colorFrame.is_valid())
-    {
-        *width = colorFrame.width();
-        *height = colorFrame.height();
-        const astra::RgbPixel* rgbData = colorFrame.data();
-
-        // RgbPixel 포인터를 uint8_t 포인터로 변환
-        return reinterpret_cast<const uint8_t*>(rgbData);
-    }else{
-        setLastError("Get Color Frame Failed");
-        std::cout << "Get Color Frame Failed...!" << std::endl;
-    } 
-    return NULL;
+    if (context->colorBuffer.empty()) return NULL;
+    *width = context->frameWidth;
+    *height = context->frameHeight;
+    return context->colorBuffer.data();
 #else
     openni::VideoFrameRef frame;
     if (context->colorStream.readFrame(&frame) == openni::STATUS_OK && frame.isValid())

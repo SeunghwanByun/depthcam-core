@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include "viewerModule.h"
 #include "../frameDefinitions.h"
 #include "../AlgorithmModule/voModule.h"
@@ -17,6 +19,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <time.h>
+#include <stdatomic.h>
 
 // Monitor Resolution Information
 #ifdef _WIN32
@@ -44,8 +47,14 @@ int isDraggingRight = 0;
 int lastRightX = 0, lastRightY = 0;
 
 // Window dimensions (updated in framebuffer_size_callback)
-static int windowWidth = 800;
-static int windowHeight = 600;
+static int windowWidth = 1280;
+static int windowHeight = 720;
+
+static int showDepth = 0;
+static unsigned long inputFrames = 0;
+static float inputFps = 0;
+static uint8_t* previewPixels = NULL;
+static size_t previewCapacity = 0;
 
 // Message Queue Handle
 mqd_t mqReceive = -1;
@@ -64,13 +73,35 @@ static int viewerIsPlayback = 0;
 static char lastRecordedFilename[256] = "";
 
 // VO state tracked in viewer
-static int viewerVoActive = 0;  // 0 = off, 1 = on
+static atomic_int viewerVoActive = 0;  // 0 = off, 1 = on
 
 // VO map display buffer — updated incrementally (only when map grows)
 #define VO_MAX_DISPLAY_POINTS 300000
 static float  s_voDisplayBuf[VO_MAX_DISPLAY_POINTS * 6];
 static int    s_voDisplayCount  = 0;
 static int    s_voLastSyncCount = 0;  // how many points were copied last time
+
+static pthread_mutex_t resultMutex = PTHREAD_MUTEX_INITIALIZER;
+static float resultPoints[VO_MAX_DISPLAY_POINTS * 6];
+static float resultPath[10000 * 3];
+static int resultPointCount=0, resultPathCount=0, resultAvailable=0;
+static float resultFps=0;
+static char resultStatus[96]="Waiting";
+
+int viewerPublishSlamResult(const float* points, int count, const float* path,
+                           int pathCount, const char* status, float fps){
+  if(count<0 || count>VO_MAX_DISPLAY_POINTS || pathCount<0 || pathCount>10000 ||
+     (count && !points) || (pathCount && !path)) return 0;
+  pthread_mutex_lock(&resultMutex);
+  if(count) memcpy(resultPoints,points,(size_t)count*6*sizeof(float));
+  if(pathCount) memcpy(resultPath,path,(size_t)pathCount*3*sizeof(float));
+  resultPointCount=count; resultPathCount=pathCount;
+  resultAvailable=status!=NULL || count>0 || pathCount>0;
+  resultFps=fps;
+  snprintf(resultStatus,sizeof(resultStatus),"%s",status?status:"Waiting");
+  pthread_mutex_unlock(&resultMutex);
+  return 1;
+}
 
 // Data Buffer
 int16_t* depthDataBuffer = NULL;
@@ -93,12 +124,25 @@ typedef struct{
   int totalDepthChunks;
   int receivedColorChunks;
   int totalColorChunks;
+  unsigned char* depthChunkMarks;
+  unsigned char* colorChunkMarks;
   char* depthDataBuffer;
   char* colorDataBuffer;
   int isComplete;
 } FrameReceiveStatus;
 
 FrameReceiveStatus receiveStatus = {0};
+
+static void setTimeoutFromNow(struct timespec* ts, long timeoutMs){
+  clock_gettime(CLOCK_REALTIME, ts);
+  ts->tv_sec += timeoutMs / 1000;
+  ts->tv_nsec += (timeoutMs % 1000) * 1000000L;
+
+  if(ts->tv_nsec >= 1000000000L){
+    ts->tv_sec += 1;
+    ts->tv_nsec -= 1000000000L;
+  }
+}
 
 // Send a control command to LoggingModule via the control message queue
 static void viewerSendControlCommand(int command, const char* filename){
@@ -162,6 +206,10 @@ static void* safe_malloc(size_t size){
 }
 
 void initFrameReceiveStatus(FrameReceiveStatus* status, int frameId, uint32_t timestamp, int width, int height){
+  if(width <= 0 || height <= 0){
+    return;
+  }
+
   int depthDataSize = width * height * sizeof(int16_t);
   int colorDataSize = width * height * 3 * sizeof(uint8_t);
 
@@ -176,6 +224,8 @@ void initFrameReceiveStatus(FrameReceiveStatus* status, int frameId, uint32_t ti
 
   if(status->depthDataBuffer) free(status->depthDataBuffer);
   if(status->colorDataBuffer) free(status->colorDataBuffer);
+  if(status->depthChunkMarks) free(status->depthChunkMarks);
+  if(status->colorChunkMarks) free(status->colorChunkMarks);
 
   status->frameId = frameId;
   status->timestamp = timestamp;
@@ -185,9 +235,39 @@ void initFrameReceiveStatus(FrameReceiveStatus* status, int frameId, uint32_t ti
   status->totalDepthChunks = 0;
   status->receivedColorChunks = 0;
   status->totalColorChunks = 0;
+  status->depthChunkMarks = NULL;
+  status->colorChunkMarks = NULL;
   status->isComplete = 0;
   status->depthDataBuffer = newDepthBuffer;
   status->colorDataBuffer = newColorBuffer;
+}
+
+static int markChunkReceived(unsigned char** marks, int* receivedCount,
+                             int* totalChunks, int chunkIndex, int newTotalChunks){
+  if(newTotalChunks <= 0 || chunkIndex < 0 || chunkIndex >= newTotalChunks){
+    return 0;
+  }
+
+  if(*marks == NULL){
+    *marks = (unsigned char*)calloc((size_t)newTotalChunks, sizeof(unsigned char));
+    if(!*marks){
+      perror("calloc chunk marks");
+      return 0;
+    }
+    *totalChunks = newTotalChunks;
+  }
+
+  if(*totalChunks != newTotalChunks){
+    return 0;
+  }
+
+  if((*marks)[chunkIndex]){
+    return 1;
+  }
+
+  (*marks)[chunkIndex] = 1;
+  (*receivedCount)++;
+  return 1;
 }
 
 // Data Receiving Thread
@@ -216,9 +296,13 @@ void* dataReceiveThread(void* arg){
   memset(&receiveStatus, 0, sizeof(FrameReceiveStatus));
   receiveStatus.depthDataBuffer = NULL;
   receiveStatus.colorDataBuffer = NULL;
+  receiveStatus.depthChunkMarks = NULL;
+  receiveStatus.colorChunkMarks = NULL;
 
   while(viewerIsRunning){
-    ssize_t byteRead = mq_receive(mqReceive, msgBuffer, MAX_MSG_SIZE, NULL);
+    struct timespec receiveTimeout;
+    setTimeoutFromNow(&receiveTimeout, 100);
+    ssize_t byteRead = mq_timedreceive(mqReceive, msgBuffer, MAX_MSG_SIZE, NULL, &receiveTimeout);
 
     if(byteRead > 0){
       MessageHeader* header = (MessageHeader*)msgBuffer;
@@ -238,10 +322,14 @@ void* dataReceiveThread(void* arg){
             int offset = header->chunkIndex * maxDataPerMsg;
             size_t depthBufferBytes = (size_t)receiveStatus.width * (size_t)receiveStatus.height * sizeof(int16_t);
 
-            if((size_t)(offset + header->dataSize) <= depthBufferBytes){
+            if(offset >= 0 && header->dataSize > 0 &&
+               (size_t)(offset + header->dataSize) <= depthBufferBytes){
               memcpy(receiveStatus.depthDataBuffer + offset, msgBuffer + sizeof(MessageHeader), header->dataSize);
-              receiveStatus.receivedDepthChunks++;
-              receiveStatus.totalDepthChunks = header->totalChunks;
+              markChunkReceived(&receiveStatus.depthChunkMarks,
+                                &receiveStatus.receivedDepthChunks,
+                                &receiveStatus.totalDepthChunks,
+                                header->chunkIndex,
+                                header->totalChunks);
             }
           }
 
@@ -256,10 +344,14 @@ void* dataReceiveThread(void* arg){
             int offset = header->chunkIndex * maxDataPerMsg;
             size_t colorBufferBytes = (size_t)receiveStatus.width * (size_t)receiveStatus.height * 3U * sizeof(uint8_t);
 
-            if((size_t)(offset + header->dataSize) <= colorBufferBytes){
+            if(offset >= 0 && header->dataSize > 0 &&
+               (size_t)(offset + header->dataSize) <= colorBufferBytes){
               memcpy(receiveStatus.colorDataBuffer + offset, msgBuffer + sizeof(MessageHeader), header->dataSize);
-              receiveStatus.receivedColorChunks++;
-              receiveStatus.totalColorChunks = header->totalChunks;
+              markChunkReceived(&receiveStatus.colorChunkMarks,
+                                &receiveStatus.receivedColorChunks,
+                                &receiveStatus.totalColorChunks,
+                                header->chunkIndex,
+                                header->totalChunks);
             }
           }
 
@@ -298,6 +390,7 @@ void* dataReceiveThread(void* arg){
           memcpy(colorDataBuffer, receiveStatus.colorDataBuffer, currentWidth * currentHeight * 3 * sizeof(uint8_t));
 
           hasNewData = 1;
+          inputFrames++;
 
           // Feed frame to VO worker (non-blocking drop if queue full)
           if(viewerVoActive && voIsRunning()){
@@ -319,8 +412,8 @@ void* dataReceiveThread(void* arg){
       }
 
       pthread_mutex_unlock(&dataMutex);
-    }else{
-      usleep(10000);
+    }else if(errno != ETIMEDOUT && errno != EINTR){
+      perror("mq_timedreceive viewer");
       continue;
     }
   }
@@ -335,6 +428,14 @@ void* dataReceiveThread(void* arg){
   if(receiveStatus.colorDataBuffer){
     free(receiveStatus.colorDataBuffer);
     receiveStatus.colorDataBuffer = NULL;
+  }
+  if(receiveStatus.depthChunkMarks){
+    free(receiveStatus.depthChunkMarks);
+    receiveStatus.depthChunkMarks = NULL;
+  }
+  if(receiveStatus.colorChunkMarks){
+    free(receiveStatus.colorChunkMarks);
+    receiveStatus.colorChunkMarks = NULL;
   }
   pthread_mutex_unlock(&dataMutex);
 
@@ -352,136 +453,123 @@ static void drawBitmapString(float x, float y, void* font, const char* str){
   }
 }
 
-// Draw HUD overlay: recording/playback status + key hints
-static void drawHUD(){
-  int w = windowWidth;
-  int h = windowHeight;
-  if(w <= 0 || h <= 0) return;
-
+// All layout dimensions are framebuffer pixels; pointer hit tests use window pixels.
+static void overlayProjection(void){
+  glViewport(0, 0, windowWidth, windowHeight);
   glDisable(GL_DEPTH_TEST);
-  glMatrixMode(GL_PROJECTION);
-  glPushMatrix();
-  glLoadIdentity();
-  gluOrtho2D(0, w, 0, h);
-  glMatrixMode(GL_MODELVIEW);
-  glPushMatrix();
-  glLoadIdentity();
-
-  // Status indicator box (top-left)
-  float bx = 15.0f, by = (float)h - 38.0f, bw = 22.0f, bh = 22.0f;
-
-  if(viewerIsRecording){
-    glColor3f(0.9f, 0.15f, 0.15f); // red
-  }else if(viewerIsPlayback){
-    glColor3f(0.15f, 0.85f, 0.15f); // green
-  }else{
-    glColor3f(0.45f, 0.45f, 0.45f); // grey
-  }
-
-  glBegin(GL_QUADS);
-  glVertex2f(bx,      by);
-  glVertex2f(bx + bw, by);
-  glVertex2f(bx + bw, by + bh);
-  glVertex2f(bx,      by + bh);
-  glEnd();
-
-  // Status text next to box
-  glColor3f(1.0f, 1.0f, 1.0f);
-  if(viewerIsRecording){
-    char msg[300];
-    snprintf(msg, sizeof(msg), " REC  %s", lastRecordedFilename);
-    drawBitmapString(bx + bw + 4, by + 5, GLUT_BITMAP_HELVETICA_18, msg);
-  }else if(viewerIsPlayback){
-    char msg[300];
-    snprintf(msg, sizeof(msg), " PLAY  %s", lastRecordedFilename);
-    drawBitmapString(bx + bw + 4, by + 5, GLUT_BITMAP_HELVETICA_18, msg);
-  }else{
-    drawBitmapString(bx + bw + 4, by + 5, GLUT_BITMAP_HELVETICA_18, " IDLE");
-  }
-
-  // VO status (second row)
-  if(viewerVoActive && voIsRunning()){
-    float voBy = by - 28.0f;
-    int trackSt = voGetTrackingStatus();
-    if(trackSt == 1){
-      glColor3f(0.2f, 0.9f, 1.0f);  // cyan = tracking OK
-    }else if(trackSt == 2){
-      glColor3f(1.0f, 0.6f, 0.1f);  // orange = lost
-    }else{
-      glColor3f(0.6f, 0.6f, 0.6f);
-    }
-
-    glBegin(GL_QUADS);
-    glVertex2f(bx,      voBy);
-    glVertex2f(bx + bw, voBy);
-    glVertex2f(bx + bw, voBy + bh);
-    glVertex2f(bx,      voBy + bh);
-    glEnd();
-
-    glColor3f(1.0f, 1.0f, 1.0f);
-    char voMsg[64];
-    snprintf(voMsg, sizeof(voMsg), " VO  pts:%d  frm:%d",
-             voGetMapPointCount(), voGetFrameCount());
-    drawBitmapString(bx + bw + 4, voBy + 5, GLUT_BITMAP_HELVETICA_18, voMsg);
-  }
-
-  // Key hints at the bottom
-  glColor3f(0.75f, 0.75f, 0.75f);
-  drawBitmapString(10, 10, GLUT_BITMAP_HELVETICA_12,
-    "R:Record  P:Playback  S:Stop  V:VO toggle  X:VO reset  |  Left:Pan  Right:Rotate  Scroll:Zoom  ESC:Quit");
-
-  glMatrixMode(GL_PROJECTION);
-  glPopMatrix();
-  glMatrixMode(GL_MODELVIEW);
-  glPopMatrix();
-  glEnable(GL_DEPTH_TEST);
+  glMatrixMode(GL_PROJECTION); glLoadIdentity();
+  gluOrtho2D(0, windowWidth, 0, windowHeight);
+  glMatrixMode(GL_MODELVIEW); glLoadIdentity();
 }
 
-// 3D Rendering
-void display_3d_color(){
-  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+static void panelRect(float x, float y, float w, float h){
+  glBegin(GL_QUADS);
+  glVertex2f(x,y); glVertex2f(x+w,y); glVertex2f(x+w,y+h); glVertex2f(x,y+h);
+  glEnd();
+}
 
-  glLoadIdentity();
-  // Pan in camera space, then pull back by distance, then rotate, then scale
-  glTranslatef(panX, panY, -distance);
-  glRotatef(angleX, 1.0f, 0.0f, 0.0f);
-  glRotatef(angleY, 0.0f, 1.0f, 0.0f);
-  glScalef(zoom, zoom, zoom);
-
+static void drawHUD(void){
+  overlayProjection();
+  int half = windowWidth / 2;
+  glColor3f(.09f,.12f,.17f);
+  panelRect(0,windowHeight-84,windowWidth,84);
+  panelRect(0,0,windowWidth,56);
+  glColor3f(.22f,.29f,.36f); panelRect(half-1,56,2,windowHeight-140);
+  glColor3f(.3f,.85f,.85f);
+  drawBitmapString(20,windowHeight-30,GLUT_BITMAP_HELVETICA_18,"LIVE INPUT");
+  drawBitmapString(half+20,windowHeight-30,GLUT_BITMAP_HELVETICA_18,"SLAM WORKSPACE");
+  char text[256];
   pthread_mutex_lock(&dataMutex);
-
-  if(hasNewData && depthDataBuffer && colorDataBuffer && currentWidth > 0 && currentHeight > 0){
-    glBegin(GL_POINTS);
-
-    for(int y = 0; y < currentHeight; ++y){
-      for(int x = 0; x < currentWidth; ++x){
-        int index = y * currentWidth + x;
-        int depthValue = depthDataBuffer[index];
-
-        if(depthValue > 0){
-          float z_pos = depthValue / 1000.0f;
-          float x_pos = (x - currentWidth * 0.5f) * z_pos  / 570.3f;
-          float y_pos = (y - currentHeight * 0.5f) * z_pos / 570.3f;
-
-          int colorIndex = index * 3;
-          float r = colorDataBuffer[colorIndex]     / 255.0f;
-          float g = colorDataBuffer[colorIndex + 1] / 255.0f;
-          float b = colorDataBuffer[colorIndex + 2] / 255.0f;
-
-          glColor3f(r, g, b);
-          glVertex3f(-x_pos, -y_pos, -z_pos);
-        }
-      }
-    }
-
-    glEnd();
-  }
-
+  snprintf(text,sizeof(text),"%s  |  %d x %d  |  %.1f FPS",showDepth?"DEPTH (0-5m)":"RGB",currentWidth,currentHeight,inputFps);
   pthread_mutex_unlock(&dataMutex);
+  glColor3f(.75f,.8f,.86f);
+  drawBitmapString(20,windowHeight-60,GLUT_BITMAP_HELVETICA_12,text);
+  snprintf(text,sizeof(text),"%s  |  points %d  |  frames %d",
+    viewerVoActive ? (voGetTrackingStatus()==1?"Experimental VO: tracking":voGetTrackingStatus()==2?"Experimental VO: lost":"Experimental VO: initializing") : "Waiting for SLAM backend",
+    viewerVoActive?voGetMapPointCount():0,viewerVoActive?voGetFrameCount():0);
+  drawBitmapString(half+20,windowHeight-60,GLUT_BITMAP_HELVETICA_12,text);
+  pthread_mutex_lock(&resultMutex);
+  if(resultAvailable){
+    glColor3f(.09f,.12f,.17f); panelRect(half+10,windowHeight-78,half-20,30);
+    glColor3f(.3f,.85f,.85f);
+    snprintf(text,sizeof(text),"%s | %.1f FPS | %d points",resultStatus,resultFps,resultPointCount);
+    drawBitmapString(half+20,windowHeight-60,GLUT_BITMAP_HELVETICA_12,text);
+  }
+  int waiting=!viewerVoActive && !resultAvailable;
+  pthread_mutex_unlock(&resultMutex);
+  if(waiting){
+    glColor3f(.75f,.8f,.86f);
+    drawBitmapString(half+30,windowHeight/2+20,GLUT_BITMAP_HELVETICA_18,"SLAM backend not connected");
+    drawBitmapString(half+30,windowHeight/2-10,GLUT_BITMAP_HELVETICA_12,"Map results will appear here. V: experimental VO preview");
+  }
+  glColor3f(.75f,.8f,.86f);
+  drawBitmapString(18,34,GLUT_BITMAP_HELVETICA_12,"1:RGB  2:Depth  R:Record  P:Playback  S:Stop  ESC:Quit");
+  drawBitmapString(half+18,34,GLUT_BITMAP_HELVETICA_12,"V:VO  X:Reset  Left:Pan  Right:Rotate  Wheel:Zoom");
+  pthread_mutex_lock(&viewerStatusMutex);
+  drawBitmapString(18,14,GLUT_BITMAP_HELVETICA_12,viewerStatusText);
+  pthread_mutex_unlock(&viewerStatusMutex);
+  glColor3f(viewerIsRecording?1:.4f,viewerIsRecording?.3f:.8f,.4f);
+  drawBitmapString(half+18,14,GLUT_BITMAP_HELVETICA_12,viewerIsRecording?"RECORDING":viewerIsPlayback?"PLAYBACK":"LIVE");
+}
 
-  // ── VO accumulated map ────────────────────────────────────────────────────
-  // When VO is active and has data, draw the accumulated map instead of / in
-  // addition to the live cloud.  We use a vertex array for performance.
+void display_3d_color(void){
+  if(windowWidth<2 || windowHeight<142) return;
+  glClearColor(.035f,.05f,.075f,1);
+  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+  overlayProjection();
+  int half=windowWidth/2, areaHeight=windowHeight-140;
+  static double fpsTime=0;
+  static unsigned long fpsFrames=0;
+  double now=glfwGetTime();
+  pthread_mutex_lock(&dataMutex);
+  if(now-fpsTime>=1){
+    inputFps=(inputFrames-fpsFrames)/(now-fpsTime);
+    fpsFrames=inputFrames; fpsTime=now;
+  }
+  if(hasNewData && currentWidth>0 && currentHeight>0 && depthDataBuffer && colorDataBuffer){
+    size_t size=(size_t)currentWidth*currentHeight*3;
+    if(size>previewCapacity){
+      uint8_t* next=realloc(previewPixels,size);
+      if(next){previewPixels=next;previewCapacity=size;}
+    }
+    const uint8_t* pixels=colorDataBuffer;
+    if(showDepth && previewCapacity>=size){
+      for(size_t i=0;i<size/3;i++){
+        unsigned int d=(uint16_t)depthDataBuffer[i];
+        unsigned int v=d>5000?255:d*255/5000;
+        previewPixels[3*i]=d?(uint8_t)v:0;
+        previewPixels[3*i+1]=d?(uint8_t)(255-v):0;
+        previewPixels[3*i+2]=d?180:0;
+      }
+      pixels=previewPixels;
+    }
+    glBindTexture(GL_TEXTURE_2D,depthTexture);
+    glPixelStorei(GL_UNPACK_ALIGNMENT,1);
+    glTexImage2D(GL_TEXTURE_2D,0,GL_RGB,currentWidth,currentHeight,0,GL_RGB,GL_UNSIGNED_BYTE,pixels);
+    float scale=(float)(half-32)/currentWidth;
+    if(scale*currentHeight>areaHeight-24) scale=(float)(areaHeight-24)/currentHeight;
+    float w=currentWidth*scale,h=currentHeight*scale,x=(half-w)/2,y=56+(areaHeight-h)/2;
+    glEnable(GL_TEXTURE_2D); glColor3f(1,1,1);
+    glBegin(GL_QUADS);
+    glTexCoord2f(0,1);glVertex2f(x,y);glTexCoord2f(1,1);glVertex2f(x+w,y);
+    glTexCoord2f(1,0);glVertex2f(x+w,y+h);glTexCoord2f(0,0);glVertex2f(x,y+h);
+    glEnd();glDisable(GL_TEXTURE_2D);
+  }
+  pthread_mutex_unlock(&dataMutex);
+  glViewport(half,56,windowWidth-half,areaHeight);
+  glEnable(GL_DEPTH_TEST);
+  glMatrixMode(GL_PROJECTION);glLoadIdentity();
+  gluPerspective(45,(double)(windowWidth-half)/areaHeight,.1,100);
+  glMatrixMode(GL_MODELVIEW);glLoadIdentity();
+  glTranslatef(panX,panY,-distance);
+  glRotatef(angleX,1,0,0);glRotatef(angleY,0,1,0);glScalef(zoom,zoom,zoom);
+  glColor3f(.13f,.20f,.25f);
+  glBegin(GL_LINES);
+  for(int i=-10;i<=10;i++){
+    glVertex3f(i*.5f,-1,-5);glVertex3f(i*.5f,-1,5);
+    glVertex3f(-5,-1,i*.5f);glVertex3f(5,-1,i*.5f);
+  }
+  glEnd();
   if(viewerVoActive && voIsRunning()){
     int currentMapCount = voGetMapPointCount();
     if(currentMapCount != s_voLastSyncCount && currentMapCount > 0){
@@ -505,11 +593,21 @@ void display_3d_color(){
     }
   }
 
-  drawHUD();
-
-  if(window){
-    glfwSwapBuffers(window);
+  pthread_mutex_lock(&resultMutex);
+  if(resultAvailable){
+    glEnableClientState(GL_VERTEX_ARRAY); glEnableClientState(GL_COLOR_ARRAY);
+    glVertexPointer(3,GL_FLOAT,6*sizeof(float),resultPoints);
+    glColorPointer(3,GL_FLOAT,6*sizeof(float),resultPoints+3);
+    glDrawArrays(GL_POINTS,0,resultPointCount);
+    glDisableClientState(GL_COLOR_ARRAY);
+    glColor3f(.3f,.9f,.8f); glLineWidth(2);
+    glVertexPointer(3,GL_FLOAT,0,resultPath);
+    glDrawArrays(GL_LINE_STRIP,0,resultPathCount);
+    glDisableClientState(GL_VERTEX_ARRAY); glLineWidth(1);
   }
+  pthread_mutex_unlock(&resultMutex);
+  drawHUD();
+  if(window) glfwSwapBuffers(window);
 }
 
 // GLFW Error Callback
@@ -540,6 +638,9 @@ void key_callback(GLFWwindow* win, int key, int scancode, int action, int mods)
     glfwSetWindowShouldClose(win, GLFW_TRUE);
     return;
   }
+
+  if(action == GLFW_PRESS && key == GLFW_KEY_1) showDepth = 0;
+  if(action == GLFW_PRESS && key == GLFW_KEY_2) showDepth = 1;
 
   // R: start recording (auto timestamped filename)
   if(key == GLFW_KEY_R && action == GLFW_PRESS){
@@ -625,6 +726,10 @@ void mouse_button_callback(GLFWwindow* win, int button, int action, int mods)
 {
   (void)mods;
   double cx, cy;
+  int ww, wh;
+  glfwGetWindowSize(win, &ww, &wh);
+  glfwGetCursorPos(win, &cx, &cy);
+  if(action == GLFW_PRESS && (cx < ww/2 || cy < 84.0*wh/windowHeight || cy > wh-56.0*wh/windowHeight)) return;
 
   if(button == GLFW_MOUSE_BUTTON_LEFT){
     if(action == GLFW_PRESS){
@@ -688,6 +793,9 @@ void scroll_callback(GLFWwindow* win, double xoffset, double yoffset)
   (void)win;
   (void)xoffset;
 
+  double cx,cy; int ww,wh;
+  glfwGetWindowSize(win,&ww,&wh); glfwGetCursorPos(win,&cx,&cy);
+  if(cx<ww/2 || cy<84.0*wh/windowHeight || cy>wh-56.0*wh/windowHeight) return;
   const float step = 0.1f;
   if(yoffset > 0){
     zoom += step;
@@ -748,7 +856,7 @@ void* viewerThread(void* id){
   }
 #endif
 
-  window = glfwCreateWindow(screenWidth, screenHeight, "3D Viewer", NULL, NULL);
+  window = glfwCreateWindow(screenWidth>1440?1440:screenWidth, screenHeight>900?900:screenHeight, "RGB-D Workspace", NULL, NULL);
   if(!window){
     fprintf(stderr, "Failed to create GLFW window\n");
     glfwTerminate();
@@ -757,6 +865,8 @@ void* viewerThread(void* id){
   }
 
   glfwMakeContextCurrent(window);
+  glfwSwapInterval(1);
+  glfwSetWindowSizeLimits(window, 1000, 500, GLFW_DONT_CARE, GLFW_DONT_CARE);
   glfwSetWindowCloseCallback(window, window_close_callback);
   glfwSetKeyCallback(window, key_callback);
   glfwSetMouseButtonCallback(window, mouse_button_callback);
@@ -812,7 +922,7 @@ void* viewerThread(void* id){
     }
 
     pthread_mutex_lock(&viewerStatusMutex);
-    snprintf(windowTitle, sizeof(windowTitle), "3D Viewer%s - %s", stateStr, viewerStatusText);
+    snprintf(windowTitle, sizeof(windowTitle), "RGB-D Workspace%s - %s", stateStr, viewerStatusText);
     pthread_mutex_unlock(&viewerStatusMutex);
     glfwSetWindowTitle(window, windowTitle);
 
@@ -843,6 +953,8 @@ void* viewerThread(void* id){
     colorDataBuffer = NULL;
   }
 
+  free(previewPixels); previewPixels=NULL; previewCapacity=0;
+  glDeleteTextures(1,&depthTexture);
   if(window){
     glfwDestroyWindow(window);
     window = NULL;
