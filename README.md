@@ -44,7 +44,7 @@ The FPS counter measures received complete RGB-D frames.
 
 - `V`: toggle the existing experimental visual odometry worker (not full SLAM).
 - `X`: reset its accumulated map.
-- In the right panel: left drag pans, right drag rotates, wheel zooms.
+- In the right panel: left drag orbits, right drag pans, wheel adjusts viewing distance.
 - `R` / `S`: start / stop recording; `P`: play the last viewer-created recording.
 - `Esc`: exit. Terminal recording controls remain available.
 
@@ -103,3 +103,30 @@ artifacts are local and excluded from Git.
 
 Validation: `python3 tests/test_recording_to_map.py` checks blank-frame handling
 and rejects truncated, mismatched-size, missing-EOF and trailing-data recordings.
+
+
+## Camera-follow navigation
+
+The right panel follows the last accepted VO camera pose by default. It draws a
+camera frustum, a translucent image plane using the RGB frame that belongs to
+that pose, a cyan trajectory, camera-local XYZ axes and a fixed world orientation
+compass. X is red, Y green, Z blue. Orange means tracking is lost: the pose/image
+stay at the last accepted frame, rather than pretending a new pose is known.
+Coordinates match the existing negated XYZ map convention.
+
+- Left drag: orbit around the followed camera; right drag: screen-space pan.
+- Wheel: smooth proportional dolly (0.25–30 m), without scaling map geometry.
+- `F`: toggle camera follow / free orbit around the frozen camera anchor.
+- `C`: toggle the camera's own viewpoint / external chase view. Camera view hides
+  its own frustum and image plane so they cannot obscure the scene.
+- `H`: return to the default follow view; `I`: toggle the RGB image plane.
+- `V` and `X` still control VO and reset the map.
+
+View transitions are smoothed and mouse sensitivity accounts for viewport size
+and distance. VO rejects non-finite PnP motion or steps exceeding 0.5 m / 45 degrees
+per frame. This conservative handheld-camera guard avoids catastrophic pose
+jumps; fast motion or widely spaced frames can instead report tracking loss.
+It does not add SLAM relocalization or repair accumulated drift.
+
+Camera pose/image consistency and lost-tracking/reset behavior are tested by
+`ctest --test-dir build --output-on-failure`.

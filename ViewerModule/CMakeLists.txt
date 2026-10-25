@@ -32,6 +32,7 @@ target_link_libraries(ViewerModuleLib
     X11
     stdc++
     pthread
+    m
     rt
     ZmqPublisherLib
 )

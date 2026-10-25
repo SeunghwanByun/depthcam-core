@@ -50,3 +50,10 @@ target_link_libraries(Youth
 # Offline RGB-D mapping without a camera or display.
 add_executable(recording_to_map tools/recording_to_map.cpp)
 target_link_libraries(recording_to_map AlgorithmModuleLib pthread)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(test_vo_camera tests/test_vo_camera.cpp)
+    target_link_libraries(test_vo_camera AlgorithmModuleLib pthread)
+    add_test(NAME vo_camera_snapshot COMMAND test_vo_camera)
+endif()
