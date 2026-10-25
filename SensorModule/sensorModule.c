@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <errno.h>
 #include <stdarg.h>
 
 // Sensor Context
@@ -19,6 +20,18 @@ AstraContext_t* sensorContext = NULL;
 
 // Message Queue Handle
 mqd_t mqSend = -1;
+
+// Allow queue backpressure, but bound waits during startup and shutdown.
+static int sendSensorMessage(const char* data, size_t size){
+  struct timespec deadline;
+  clock_gettime(CLOCK_REALTIME, &deadline);
+  deadline.tv_nsec += 100000000L;
+  if(deadline.tv_nsec >= 1000000000L){
+    deadline.tv_sec++;
+    deadline.tv_nsec -= 1000000000L;
+  }
+  return mq_timedsend(mqSend, data, size, 0, &deadline);
+}
 
 // Thread Control Variable;
 static int sensorIsRunning = 1;
@@ -90,6 +103,7 @@ static AstraContext_t* safeInitializeAstraObj(){
 }
 
 void* sensorLoop(void* arg){
+  (void)arg;
   printf("Sensor thread started...\n");
   setSensorStatus("Sensor thread started");
 
@@ -173,7 +187,7 @@ void* sensorLoop(void* arg){
       header->frameId = frameId;
       header->timestamp = timestamp;
 
-      if(mq_send(mqSend, msgBuffer, sizeof(MessageHeader), 0) == -1){
+      if(sendSensorMessage(msgBuffer, sizeof(MessageHeader)) == -1){
         perror("mq_send metadata");
         continue;
       }
@@ -206,8 +220,10 @@ void* sensorLoop(void* arg){
         // 데이터 복사
         memcpy(msgBuffer + sizeof(MessageHeader), ((const char*)depthData) + offset, chunkSize);
 
-        if(mq_send(mqSend, msgBuffer, sizeof(MessageHeader) + chunkSize, 0) == -1){
-          perror("mq_send depth chunk");
+        if(sendSensorMessage(msgBuffer, sizeof(MessageHeader) + chunkSize) == -1){
+          if(errno != EAGAIN){
+            perror("mq_send depth chunk");
+          }
           depthChunkesSuccess = 0;
           break;
         }
@@ -241,8 +257,10 @@ void* sensorLoop(void* arg){
         // 데이터 복사
         memcpy(msgBuffer + sizeof(MessageHeader), ((const char*)colorData) + offset, chunkSize);
 
-        if(mq_send(mqSend, msgBuffer, sizeof(MessageHeader) + chunkSize, 0) == -1){
-          perror("mq_send color chunk");
+        if(sendSensorMessage(msgBuffer, sizeof(MessageHeader) + chunkSize) == -1){
+          if(errno != EAGAIN){
+            perror("mq_send color chunk");
+          }
           break;
         }
       }
@@ -343,10 +361,10 @@ void stopSensorModule(){
   clock_gettime(CLOCK_REALTIME, &timeout);
   timeout.tv_sec += 3; // 3초 타임아웃 
 
-  if(pthread_timedjoin_np(sensor_thread_id, NULL, &timeout) != 0){
-    printf("Sensor thread did not terminate within timeout, forcing...\n");
-    pthread_cancel(sensor_thread_id);
-    pthread_join(sensor_thread_id, NULL);
+  int joined = (pthread_timedjoin_np(sensor_thread_id, NULL, &timeout) == 0);
+  if(!joined){
+    printf("Sensor thread did not terminate within timeout; leaving SDK cleanup to the sensor thread.\n");
+    return;
   }
 
   // 센서 컨텍스트 정리

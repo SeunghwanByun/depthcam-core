@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include "loggingModule.h"
 #include "../frameDefinitions.h"
 #include <pthread.h>
@@ -56,12 +58,46 @@ static int currentHeight = 0;
 static int depthBufferSize = 0;
 static int colorBufferSize = 0;
 
-// 현재 시간 가져오기 (밀리초)
-static uint32_t getCurrentTimeMS(){
-  struct timeval tv;
+static void setTimeoutFromNow(struct timespec* ts, long timeoutMs){
+  clock_gettime(CLOCK_REALTIME, ts);
+  ts->tv_sec += timeoutMs / 1000;
+  ts->tv_nsec += (timeoutMs % 1000) * 1000000L;
 
-  gettimeofday(&tv, NULL);
-  return (uint32_t)(tv.tv_sec * 1000 + tv.tv_usec / 1000);
+  if(ts->tv_nsec >= 1000000000L){
+    ts->tv_sec += 1;
+    ts->tv_nsec -= 1000000000L;
+  }
+}
+
+static void closeRecordFileLocked(void){
+  if(recordFile){
+    FrameHeader endHeader = {0};
+    endHeader.frameType = FRAME_TYPE_END_OF_FILE;
+    fwrite(&endHeader, sizeof(FrameHeader), 1, recordFile);
+    fclose(recordFile);
+    recordFile = NULL;
+  }
+  isRecordingData = 0;
+}
+
+static int ensurePlaybackBuffer(char** buffer, size_t* capacity, size_t requiredSize){
+  if(requiredSize == 0){
+    return 1;
+  }
+
+  if(*capacity >= requiredSize){
+    return 1;
+  }
+
+  char* newBuffer = (char*)realloc(*buffer, requiredSize);
+  if(!newBuffer){
+    perror("Failed to allocate playback buffer");
+    return 0;
+  }
+
+  *buffer = newBuffer;
+  *capacity = requiredSize;
+  return 1;
 }
 
 // 버퍼 재할당 함수
@@ -131,6 +167,7 @@ static void saveFrameToFile(int frameId, uint32_t timestamp){
 
 // 로거 스레드 함수
 static void* loggerThread(void* arg){
+  (void)arg;
   printf("Logger thread started...\n");
 
   // 메세지 큐 속성 설정
@@ -218,17 +255,8 @@ static void* loggerThread(void* arg){
             // 녹화 중지 명령 처리
             if(isRecordingData){
               pthread_mutex_lock(&recordMutex);
-              isRecordingData = 0;
-              if(recordFile){
-                // 종료 마커 쓰기
-                FrameHeader endHeader = {0};
-                endHeader.frameType = FRAME_TYPE_END_OF_FILE;
-                fwrite(&endHeader, sizeof(FrameHeader), 1, recordFile);
-
-                fclose(recordFile);
-                recordFile = NULL;
-                printf("Stopped recording. %u frames saved.\n", frameCounter);
-              }
+              closeRecordFileLocked();
+              printf("Stopped recording. %u frames saved.\n", frameCounter);
               pthread_mutex_unlock(&recordMutex);
             }
             break;
@@ -274,15 +302,19 @@ static void* loggerThread(void* arg){
       }
     }
 
-    // 센서 데이터 수신 (blocking)
-    ssize_t bytesRead = mq_receive(mqFromSensor, msgBuffer, MAX_MSG_SIZE, NULL);
+    // 센서 데이터 수신. 타임아웃을 둬서 종료 플래그를 주기적으로 확인한다.
+    struct timespec receiveTimeout;
+    setTimeoutFromNow(&receiveTimeout, 100);
+    ssize_t bytesRead = mq_timedreceive(mqFromSensor, msgBuffer, MAX_MSG_SIZE, NULL, &receiveTimeout);
 
     if(bytesRead > 0){
       MessageHeader* header = (MessageHeader*)msgBuffer;
 
       // 뷰어로 데이터 직접 전달 (패스스루)
       if(isPassThroughEnabled){
-        if(mq_send(mqToViewer, msgBuffer, bytesRead, 0) == -1){
+        struct timespec sendTimeout;
+        setTimeoutFromNow(&sendTimeout, 100);
+        if(mq_timedsend(mqToViewer, msgBuffer, bytesRead, 0, &sendTimeout) == -1){
           perror("mq_send to viewer");
         }
       }
@@ -355,6 +387,8 @@ static void* loggerThread(void* arg){
         saveFrameToFile(header->frameId, header->timestamp);
         frameCounter++;
       }
+    }else if(errno != ETIMEDOUT && errno != EINTR){
+      perror("mq_timedreceive from sensor");
     }
   }
 
@@ -387,11 +421,7 @@ static void* loggerThread(void* arg){
   // 녹화 중이었다면 파일 닫기
   pthread_mutex_lock(&recordMutex);
 
-  if(recordFile){
-    fclose(recordFile);
-    recordFile = NULL;
-    isRecordingData = 0;
-  }
+  closeRecordFileLocked();
 
   pthread_mutex_unlock(&recordMutex);
 
@@ -401,7 +431,9 @@ static void* loggerThread(void* arg){
 }
 
 // 파일에서 하나의 프레임 읽기
-static int readFrameFromFile(FILE* file, FrameHeader* header, char* depthData, char* colorData, int maxSize){
+static int readFrameFromFile(FILE* file, FrameHeader* header,
+                             char** depthData, size_t* depthCapacity,
+                             char** colorData, size_t* colorCapacity){
   // 헤더 읽기
   size_t headerRead = fread(header, sizeof(FrameHeader), 1, file);
   if(headerRead != 1){
@@ -420,21 +452,27 @@ static int readFrameFromFile(FILE* file, FrameHeader* header, char* depthData, c
     return 0;
   }
 
-  // 데이터 크기 유효성 검사
-  if(header->depthDataSize > maxSize || header->colorDataSize > maxSize){
-    printf("Frame data too large: depth=%u, color=%u, max=%d\n", header->depthDataSize, header->colorDataSize, maxSize);
+  if(header->width == 0 || header->height == 0 ||
+     header->depthDataSize == 0 || header->colorDataSize == 0){
+    printf("Invalid frame header: width=%u, height=%u, depth=%u, color=%u\n",
+           header->width, header->height, header->depthDataSize, header->colorDataSize);
+    return 0;
+  }
+
+  if(!ensurePlaybackBuffer(depthData, depthCapacity, header->depthDataSize) ||
+     !ensurePlaybackBuffer(colorData, colorCapacity, header->colorDataSize)){
     return 0;
   }
 
   // 깊이 데이터 읽기
-  size_t depthRead = fread(depthData, 1, header->depthDataSize, file);
+  size_t depthRead = fread(*depthData, 1, header->depthDataSize, file);
   if(depthRead != header->depthDataSize){
     perror("Error reading depth data");
     return 0;
   }
 
   // 색상 데이터 읽기
-  size_t colorRead = fread(colorData, 1, header->colorDataSize, file);
+  size_t colorRead = fread(*colorData, 1, header->colorDataSize, file);
   if(colorRead != header->colorDataSize){
     perror("Error reading color data");
     return 0;
@@ -503,6 +541,7 @@ static void sendMetadata(mqd_t mqdes, int frameId, uint32_t timestamp, int width
 
 // 재생 스레드 함수
 static void* playbackThread(void* arg){
+  (void)arg;
   printf("Playback thread started...\n");
 
   // 메세지 큐 속성 설정
@@ -519,25 +558,11 @@ static void* playbackThread(void* arg){
     return NULL;
   }
 
-  // 제어 메세지를 위한 임시 버퍼
-  char controlBuffer[MAX_MSG_SIZE];
-
   // 데이터 버퍼
   char* playbackDepthBuffer = NULL;
   char* playbackColorBuffer = NULL;
-  int maxBufferSize = 1024 * 1024; // 1MB 초기 할당
-
-  
-  playbackDepthBuffer = (char*)malloc(maxBufferSize);
-  playbackColorBuffer = (char*)malloc(maxBufferSize);
-
-  if(!playbackDepthBuffer || !playbackColorBuffer){
-    perror("malloc playback buffers");
-    free(playbackDepthBuffer);
-    free(playbackColorBuffer);
-    mq_close(mqPlaybackToViewer);
-    return NULL;
-  }
+  size_t playbackDepthCapacity = 0;
+  size_t playbackColorCapacity = 0;
 
   while(loggingIsRunning){
     // 플레이백 모드가 아니면 대기
@@ -564,7 +589,9 @@ static void* playbackThread(void* arg){
 
     // 프레임 읽기
     FrameHeader header;
-    if(!readFrameFromFile(playbackFile, &header, playbackDepthBuffer, playbackColorBuffer, maxBufferSize)){
+    if(!readFrameFromFile(playbackFile, &header,
+                          &playbackDepthBuffer, &playbackDepthCapacity,
+                          &playbackColorBuffer, &playbackColorCapacity)){
       // 파일 끝이거나 오류 발생
       fclose(playbackFile);
       playbackFile = NULL;
@@ -649,6 +676,9 @@ void initLoggingModule(){
   loggingIsRunning = 1;
   isRecordingData = 0;
   isPlaybackActive = 0;
+  isPassThroughEnabled = 1;
+  receivedDepthFrame = 0;
+  receivedColorFrame = 0;
   recordFile = NULL;
   playbackFile = NULL;
   currentRecordFilename[0] = '\0';
@@ -667,14 +697,13 @@ void initLoggingModule(){
 void stopLoggingModule(){
   printf("Stopping logging module...\n");
 
+  // 먼저 로거 스레드가 제어 명령을 처리할 수 있게 녹화/재생 종료를 요청한다.
+  stopRecording();
+  stopPlayback();
+  usleep(200000);
+
   // 스레드 종료 플레그 설정
   loggingIsRunning = 0;
-
-  // 녹화 중지
-  stopRecording();
-
-  // 재생 중지
-  stopPlayback();
 
   // 스레드 종료 대기
   printf("Waiting for logger thread to terminate...\n");
