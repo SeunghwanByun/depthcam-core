@@ -25,6 +25,10 @@ static const float MAX_DEPTH_M       = 7.00f;
 static const int   DEPTH_SAMPLE_STEP = 8;    // add 1 map point every NxN depth pixels
 static const int   MAX_QUEUE_SIZE    = 3;    // drop frames if worker is behind
 static const int   MAX_MAP_POINTS    = 1000000;
+// Conservative handheld RGB-D motion limits per accepted frame. Degenerate
+// depth/PnP fits must not teleport the map or the following viewer camera.
+static const double MAX_STEP_METRES = 0.5;
+static const double MAX_STEP_RADIANS = 0.7853981633974483; // 45 degrees
 
 // ─── Camera intrinsics ───────────────────────────────────────────────────────
 
@@ -37,6 +41,10 @@ static float g_cx = 320.0f, g_cy = 240.0f;
 static float*      g_mapBuf   = nullptr;
 static int         g_mapCount = 0;
 static std::mutex  g_mapMtx;
+static VoCameraState g_camera = {};
+static std::vector<uint8_t> g_cameraRgb;
+static std::vector<float> g_trajectory;
+static unsigned int g_cameraRevision = 0;
 
 // ─── Worker thread state ─────────────────────────────────────────────────────
 
@@ -73,6 +81,18 @@ static void addFrameToMap(const cv::Mat& colorRGB, const cv::Mat& depthF)
     std::lock_guard<std::mutex> lk(g_mapMtx);
 
     const double* Tw = g_T_w_c.ptr<double>(0); // row-major 4×4
+    // Map storage negates all three world coordinates. Local camera coordinates
+    // use the same convention: S*T*S has R unchanged and translation -t.
+    for(int row=0;row<4;row++) for(int col=0;col<4;col++)
+        g_camera.cameraToWorld[col*4+row] = (float)g_T_w_c.at<double>(row,col);
+    for(int axis=0;axis<3;axis++) g_camera.cameraToWorld[12+axis] *= -1;
+    g_camera.fx=g_fx;g_camera.fy=g_fy;g_camera.cx=g_cx;g_camera.cy=g_cy;
+    g_camera.width=colorRGB.cols;g_camera.height=colorRGB.rows;
+    g_camera.valid=1;g_camera.revision=++g_cameraRevision;
+    g_cameraRgb.assign(colorRGB.data,colorRGB.data+colorRGB.total()*3);
+    if(g_trajectory.size()>=30000)g_trajectory.erase(g_trajectory.begin(),g_trajectory.begin()+3000);
+    for(int axis=0;axis<3;axis++)g_trajectory.push_back(g_camera.cameraToWorld[12+axis]);
+
 
     for (int row = 0; row < depthF.rows && g_mapCount < MAX_MAP_POINTS; row += DEPTH_SAMPLE_STEP) {
         const float* drow  = depthF.ptr<float>(row);
@@ -241,7 +261,11 @@ static void workerLoop()
                 inliers,
                 cv::SOLVEPNP_ITERATIVE);
 
-            if (ok && inliers.rows >= MIN_INLIERS) {
+            bool plausible = ok && cv::checkRange(rvec) && cv::checkRange(tvec) &&
+                cv::norm(tvec) <= MAX_STEP_METRES && cv::norm(rvec) <= MAX_STEP_RADIANS;
+            if(ok && !plausible)
+                printf("[VO] rejected implausible motion at frame %d\n", frameIdx);
+            if (plausible && inliers.rows >= MIN_INLIERS) {
                 // T_c1_c0: transforms prev-cam coords → curr-cam coords
                 cv::Mat T_c1_c0 = makeTFromRvecTvec(rvec, tvec);
 
@@ -282,8 +306,13 @@ void voInit(float fx, float fy, float cx, float cy)
     g_fx = fx; g_fy = fy;
     g_cx = cx; g_cy = cy;
 
-    g_mapBuf = new float[(size_t)MAX_MAP_POINTS * 6]();
-    g_mapCount = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_mapMtx);
+        g_mapBuf = new float[(size_t)MAX_MAP_POINTS * 6]();
+        g_mapCount = 0;
+        g_camera = {};
+        g_cameraRgb.clear();g_trajectory.clear();
+    }
 
     g_prevGray   = cv::Mat();
     g_prevDepthF = cv::Mat();
@@ -312,6 +341,7 @@ void voStop(void)
     delete[] g_mapBuf;
     g_mapBuf   = nullptr;
     g_mapCount = 0;
+    g_camera = {};g_cameraRgb.clear();g_trajectory.clear();
     g_status   = 0;
 
     printf("[VO] stopped\n");
@@ -361,6 +391,17 @@ int voGetMapPoints(float* dst, int max_points)
         }
     }
     return n;
+}
+
+int voGetCameraState(VoCameraState* state, uint8_t* rgb, int capacity,
+                     float* trajectory, int maxVertices){
+    std::lock_guard<std::mutex> lock(g_mapMtx);
+    if(state)*state=g_camera;
+    if(rgb && capacity>=0 && (size_t)capacity>=g_cameraRgb.size())
+        std::copy(g_cameraRgb.begin(),g_cameraRgb.end(),rgb);
+    int count=std::min(std::max(0,maxVertices),(int)g_trajectory.size()/3);
+    if(trajectory && count)std::copy(g_trajectory.end()-count*3,g_trajectory.end(),trajectory);
+    return count;
 }
 
 int voGetMapPointCount(void)

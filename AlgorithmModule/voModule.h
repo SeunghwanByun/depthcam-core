@@ -27,6 +27,18 @@ void voProcessFrame(const int16_t* depth16, const uint8_t* rgb,
 // Returns number of points written.
 int voGetMapPoints(float* dst, int max_points);
 
+// Thread-safe last accepted camera pose and matching RGB image. Column-major
+// matrix maps local viewer coordinates to the same negated world as map points.
+// Pose/image remain at the last accepted frame if tracking is lost.
+typedef struct {
+    float cameraToWorld[16];
+    float fx, fy, cx, cy;
+    int width, height, valid;
+    unsigned int revision;
+} VoCameraState;
+int voGetCameraState(VoCameraState* state, uint8_t* rgb, int rgbCapacity,
+                     float* trajectory, int maxVertices);
+
 // Fast query — no copy.
 int voGetMapPointCount(void);
 

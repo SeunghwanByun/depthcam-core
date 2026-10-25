@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <stdatomic.h>
+#include <math.h>
 
 // Monitor Resolution Information
 #ifdef _WIN32
@@ -33,15 +34,21 @@
 GLuint depthTexture;
 GLuint colorTexture;
 
-// Camera state
-float angleX = 0.0f;
-float angleY = 0.0f;
-float distance = 2.0f;
-float zoom = 1.0f;
-float panX = 0.0f;
-float panY = 0.0f;
+// Camera-relative orbit/chase controls, in metres and degrees.
+static float angleX=18, angleY=24, distance=2.2f, panX=0, panY=0;
+static int followCamera=1, cameraView=0, showCameraImage=1;
+static int smoothViewValid=0;
+static float anchor[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+static float smoothEye[3], smoothTarget[3], smoothUp[3];
+static VoCameraState cameraState={0};
+static uint8_t* cameraRgb=NULL;
+static size_t cameraRgbCapacity=0;
+static unsigned int uploadedCameraRevision=0;
+static float cameraPath[30000];
+static int cameraPathCount=0;
+static int seenPlaybackGeneration=0;
 
-// Mouse drag state (left = pan, right = rotate)
+// Mouse drag state (left = orbit, right = pan)
 int isDragging = 0;
 int lastMouseX = 0, lastMouseY = 0;
 int isDraggingRight = 0;
@@ -187,6 +194,12 @@ void initOpenGL()
     glBindTexture(GL_TEXTURE_2D, depthTexture);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glGenTextures(1, &colorTexture);
+    glBindTexture(GL_TEXTURE_2D,colorTexture);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
@@ -517,6 +530,13 @@ static void drawHUD(void){
   }
   int waiting=!viewerVoActive && !resultAvailable;
   pthread_mutex_unlock(&resultMutex);
+  // Drawn after the result panel so its background cannot cover the camera line.
+  glColor3f(.4f,.8f,.8f);
+  snprintf(text,sizeof(text),"%s | Camera %.2f, %.2f, %.2f m%s",
+    cameraView?"CAMERA VIEW":followCamera?"FOLLOW":"FREE ORBIT",
+    cameraState.cameraToWorld[12],cameraState.cameraToWorld[13],cameraState.cameraToWorld[14],
+    cameraState.valid?(voGetTrackingStatus()==1?"":" (last valid pose)"):" (waiting)");
+  drawBitmapString(half+20,windowHeight-78,GLUT_BITMAP_HELVETICA_12,text);
   if(waiting){
     glColor3f(.75f,.8f,.86f);
     drawBitmapString(half+30,windowHeight/2+20,GLUT_BITMAP_HELVETICA_18,"SLAM backend not connected");
@@ -524,7 +544,7 @@ static void drawHUD(void){
   }
   glColor3f(.75f,.8f,.86f);
   drawBitmapString(18,34,GLUT_BITMAP_HELVETICA_12,"1:RGB  2:Depth  R:Record  P:Replay  S:Stop  M:Save map  ESC:Quit");
-  drawBitmapString(half+18,34,GLUT_BITMAP_HELVETICA_12,"V:VO  X:Reset  Left:Pan  Right:Rotate  Wheel:Zoom");
+  drawBitmapString(half+18,34,GLUT_BITMAP_HELVETICA_12,"Left:Orbit  Right:Pan  Wheel:Dolly  F:Follow  C:Camera  H:Home  I:Image");
   glColor3f(rec.writeError?1:.3f,rec.writeError?.3f:.85f,.4f);
   snprintf(text,sizeof(text),"%s | Saved: %u frames | %.1f MiB",
     rec.writeError?"RECORDING ERROR":rec.active?"REC":rec.path[0]?"SAVED":"LIVE",
@@ -545,6 +565,127 @@ static void drawHUD(void){
   }
   drawBitmapString(half+18,14,GLUT_BITMAP_HELVETICA_12,path);
 
+}
+
+static float clampf(float v,float lo,float hi){return fmaxf(lo,fminf(hi,v));}
+static void normalize3(float* v){
+  float n=sqrtf(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]);
+  if(n>1e-6f)for(int i=0;i<3;i++)v[i]/=n;
+}
+static void cross3(const float* a,const float* b,float* out){
+  out[0]=a[1]*b[2]-a[2]*b[1];out[1]=a[2]*b[0]-a[0]*b[2];out[2]=a[0]*b[1]-a[1]*b[0];
+}
+static void transformPoint(const float* m,const float* p,float* out){
+  for(int i=0;i<3;i++)out[i]=m[i]*p[0]+m[4+i]*p[1]+m[8+i]*p[2]+m[12+i];
+}
+static void resetView(void){
+  angleX=18;angleY=24;distance=2.2f;panX=panY=0;
+  followCamera=1;cameraView=0;
+}
+static void updateCameraSnapshot(void){
+  VoCameraState next={0};
+  voGetCameraState(&next,NULL,0,NULL,0);
+  size_t required=(size_t)next.width*next.height*3;
+  if(required>cameraRgbCapacity && required<=4096U*4096U*3U){
+    uint8_t* buffer=realloc(cameraRgb,required);
+    if(buffer){cameraRgb=buffer;cameraRgbCapacity=required;}
+  }
+  cameraPathCount=voGetCameraState(&cameraState,cameraRgb,(int)cameraRgbCapacity,cameraPath,10000);
+  required=(size_t)cameraState.width*cameraState.height*3;
+  if(cameraState.valid && cameraRgb && required<=cameraRgbCapacity &&
+     uploadedCameraRevision!=cameraState.revision){
+    glBindTexture(GL_TEXTURE_2D,colorTexture);
+    glPixelStorei(GL_UNPACK_ALIGNMENT,1);
+    glTexImage2D(GL_TEXTURE_2D,0,GL_RGB,cameraState.width,cameraState.height,0,GL_RGB,GL_UNSIGNED_BYTE,cameraRgb);
+    uploadedCameraRevision=cameraState.revision;
+  }
+  if(followCamera && cameraState.valid)memcpy(anchor,cameraState.cameraToWorld,sizeof(anchor));
+  if(seenPlaybackGeneration!=lastPlaybackGeneration){
+    seenPlaybackGeneration=lastPlaybackGeneration;
+    smoothViewValid=0;resetView();
+  }
+}
+static void applyCameraView(void){
+  static double previous=0;
+  double now=glfwGetTime();float dt=previous?clampf((float)(now-previous),0,.1f):.016f;previous=now;
+  float yaw=angleY*.01745329252f, pitch=angleX*.01745329252f;
+  float localEye[3]={distance*cosf(pitch)*sinf(yaw),distance*sinf(pitch),distance*cosf(pitch)*cosf(yaw)};
+  float localTarget[3]={0,0,-.65f};
+  if(cameraView){localEye[0]=localEye[1]=localEye[2]=0;localTarget[2]=-1;}
+  float eye[3],target[3],up[3]={anchor[4],anchor[5],anchor[6]};
+  transformPoint(anchor,localEye,eye);transformPoint(anchor,localTarget,target);
+  float forward[3],right[3];for(int i=0;i<3;i++)forward[i]=target[i]-eye[i];normalize3(forward);
+  cross3(forward,up,right);normalize3(right);cross3(right,forward,up);normalize3(up);
+  for(int i=0;i<3;i++){
+    float offset=cameraView?0:right[i]*panX+up[i]*panY;
+    eye[i]+=offset;target[i]+=offset;
+  }
+  float blend=1-expf(-dt*10);
+  for(int i=0;i<3;i++){
+    smoothEye[i]=smoothViewValid?smoothEye[i]+blend*(eye[i]-smoothEye[i]):eye[i];
+    smoothTarget[i]=smoothViewValid?smoothTarget[i]+blend*(target[i]-smoothTarget[i]):target[i];
+    smoothUp[i]=smoothViewValid?smoothUp[i]+blend*(up[i]-smoothUp[i]):up[i];
+  }
+  normalize3(smoothUp);smoothViewValid=1;
+  gluLookAt(smoothEye[0],smoothEye[1],smoothEye[2],smoothTarget[0],smoothTarget[1],smoothTarget[2],smoothUp[0],smoothUp[1],smoothUp[2]);
+}
+static void drawAxes(float length){
+  glLineWidth(2);glBegin(GL_LINES);
+  glColor3f(1,.25f,.25f);glVertex3f(0,0,0);glVertex3f(length,0,0);
+  glColor3f(.3f,1,.4f);glVertex3f(0,0,0);glVertex3f(0,length,0);
+  glColor3f(.3f,.6f,1);glVertex3f(0,0,0);glVertex3f(0,0,length);
+  glEnd();
+  const char labels[3]={'X','Y','Z'};
+  for(int i=0;i<3;i++){
+    glColor3f(i==0?1:.3f,i==1?1:.4f,i==2?1:.3f);
+    glRasterPos3f(i==0?length*1.1f:0,i==1?length*1.1f:0,i==2?length*1.1f:0);
+    glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12,labels[i]);
+  }
+  glLineWidth(1);
+}
+// A fixed orientation compass remains visible even when the world origin is off-screen.
+static void drawOrientationCompass(void){
+  GLfloat view[16];glGetFloatv(GL_MODELVIEW_MATRIX,view);
+  view[12]=view[13]=view[14]=0;
+  glViewport(windowWidth-112,windowHeight-196,96,96);
+  glEnable(GL_SCISSOR_TEST);glScissor(windowWidth-112,windowHeight-196,96,96);
+  glClear(GL_DEPTH_BUFFER_BIT);glDisable(GL_SCISSOR_TEST);
+  glMatrixMode(GL_PROJECTION);glLoadIdentity();glOrtho(-1.3,1.3,-1.3,1.3,-4,4);
+  glMatrixMode(GL_MODELVIEW);glLoadMatrixf(view);
+  drawAxes(.85f);
+}
+
+static void drawTrackedCamera(void){
+  if(!cameraState.valid)return;
+  int lost=voGetTrackingStatus()!=1;
+  glDisable(GL_DEPTH_TEST); // Keep the path and current camera visible through the map.
+  glColor3f(.2f,.85f,.95f);glLineWidth(2);
+  glEnableClientState(GL_VERTEX_ARRAY);glVertexPointer(3,GL_FLOAT,0,cameraPath);
+  glDrawArrays(GL_LINE_STRIP,0,cameraPathCount);glDisableClientState(GL_VERTEX_ARRAY);
+  glEnable(GL_DEPTH_TEST);
+  if(cameraView){glLineWidth(1);return;}
+  glPushMatrix();glMultMatrixf(cameraState.cameraToWorld);
+  const float z=.38f;
+  float left=-(cameraState.width-cameraState.cx)*z/cameraState.fx;
+  float right=cameraState.cx*z/cameraState.fx;
+  float bottom=-(cameraState.height-cameraState.cy)*z/cameraState.fy;
+  float top=cameraState.cy*z/cameraState.fy;
+  if(showCameraImage && uploadedCameraRevision==cameraState.revision){
+    glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);glDepthMask(GL_FALSE);
+    glEnable(GL_TEXTURE_2D);glBindTexture(GL_TEXTURE_2D,colorTexture);glColor4f(1,1,1,.65f);
+    glBegin(GL_QUADS);
+    // The legacy map negates X as well as Y/Z, so texture U is reversed.
+    glTexCoord2f(1,1);glVertex3f(left,bottom,-z);glTexCoord2f(0,1);glVertex3f(right,bottom,-z);
+    glTexCoord2f(0,0);glVertex3f(right,top,-z);glTexCoord2f(1,0);glVertex3f(left,top,-z);
+    glEnd();glDisable(GL_TEXTURE_2D);glDepthMask(GL_TRUE);glDisable(GL_BLEND);
+  }
+  glDisable(GL_DEPTH_TEST);
+  glColor3f(lost?1:.2f,lost?.6f:1,lost?.1f:.85f);glLineWidth(2);
+  glBegin(GL_LINE_LOOP);glVertex3f(left,bottom,-z);glVertex3f(right,bottom,-z);glVertex3f(right,top,-z);glVertex3f(left,top,-z);glEnd();
+  glBegin(GL_LINES);
+  for(int i=0;i<4;i++){glVertex3f(0,0,0);glVertex3f(i&1?right:left,i&2?top:bottom,-z);}
+  glEnd();glPointSize(9);glBegin(GL_POINTS);glVertex3f(0,0,0);glEnd();glPointSize(2);
+  drawAxes(.25f);glPopMatrix();glEnable(GL_DEPTH_TEST);glLineWidth(1);
 }
 
 void display_3d_color(void){
@@ -596,8 +737,11 @@ void display_3d_color(void){
   glMatrixMode(GL_PROJECTION);glLoadIdentity();
   gluPerspective(45,(double)(windowWidth-half)/areaHeight,.1,100);
   glMatrixMode(GL_MODELVIEW);glLoadIdentity();
-  glTranslatef(panX,panY,-distance);
-  glRotatef(angleX,1,0,0);glRotatef(angleY,0,1,0);glScalef(zoom,zoom,zoom);
+  pthread_mutex_lock(&dataMutex);
+  updateCameraSnapshot();
+  pthread_mutex_unlock(&dataMutex);
+  applyCameraView();
+  drawAxes(.5f);
   glColor3f(.13f,.20f,.25f);
   glBegin(GL_LINES);
   for(int i=-10;i<=10;i++){
@@ -643,6 +787,8 @@ void display_3d_color(void){
     glDisableClientState(GL_VERTEX_ARRAY); glLineWidth(1);
   }
   pthread_mutex_unlock(&resultMutex);
+  drawTrackedCamera();
+  drawOrientationCompass();
   drawHUD();
   if(window) glfwSwapBuffers(window);
 }
@@ -678,6 +824,13 @@ void key_callback(GLFWwindow* win, int key, int scancode, int action, int mods)
 
   if(action == GLFW_PRESS && key == GLFW_KEY_1) showDepth = 0;
   if(action == GLFW_PRESS && key == GLFW_KEY_2) showDepth = 1;
+
+  if(action==GLFW_PRESS){
+    if(key==GLFW_KEY_F){followCamera=!followCamera;cameraView=0;}
+    if(key==GLFW_KEY_C){cameraView=!cameraView;followCamera=1;panX=panY=0;}
+    if(key==GLFW_KEY_H)resetView();
+    if(key==GLFW_KEY_I)showCameraImage=!showCameraImage;
+  }
 
   // R: start recording (auto timestamped filename)
   if(key == GLFW_KEY_R && action == GLFW_PRESS){
@@ -778,8 +931,7 @@ void key_callback(GLFWwindow* win, int key, int scancode, int action, int mods)
 }
 
 // Mouse Button Callback
-// Left button  → pan
-// Right button → rotate / tilt
+// Left button -> orbit around the camera; right button -> screen-space pan
 void mouse_button_callback(GLFWwindow* win, int button, int action, int mods)
 {
   (void)mods;
@@ -813,55 +965,37 @@ void mouse_button_callback(GLFWwindow* win, int button, int action, int mods)
 }
 
 // Mouse Move Callback
-// Left drag  → pan (matching lidar-core 0.002/zoom scale)
-// Right drag → rotate (matching lidar-core 0.2 deg/px)
+// Normalize motion to viewport size and clamp large pointer jumps.
 void cursor_position_callback(GLFWwindow* win, double xpos, double ypos)
 {
   (void)win;
 
+  int ww,wh;glfwGetWindowSize(win,&ww,&wh);
+  if(ww<1 || wh<1)return;
+  float panelHeight=(float)wh*(windowHeight-140)/windowHeight;
   if(isDragging){
-    int dx = (int)xpos - lastMouseX;
-    int dy = (int)ypos - lastMouseY;
-
-    // Pan in camera space; divide by zoom so pan feels same speed at any zoom level
-    float safeZoom = (zoom > 0.01f) ? zoom : 0.01f;
-    panX -= dx * 0.002f / safeZoom;
-    panY += dy * 0.002f / safeZoom;
-
-    lastMouseX = (int)xpos;
-    lastMouseY = (int)ypos;
+    float dx=clampf((float)xpos-lastMouseX,-40,40),dy=clampf((float)ypos-lastMouseY,-40,40);
+    cameraView=0;
+    angleY-=dx*120/(ww*.5f);
+    angleX=clampf(angleX+dy*100/panelHeight,-75,75);
+    lastMouseX=(int)xpos;lastMouseY=(int)ypos;
   }
-
   if(isDraggingRight){
-    int dx = (int)xpos - lastRightX;
-    int dy = (int)ypos - lastRightY;
-
-    // Rotation sensitivity 0.2 deg/px — matches lidar-core viewer
-    angleY += dx * 0.2f;
-    angleX += dy * 0.2f;
-
-    lastRightX = (int)xpos;
-    lastRightY = (int)ypos;
+    float dx=clampf((float)xpos-lastRightX,-40,40),dy=clampf((float)ypos-lastRightY,-40,40);
+    cameraView=0;
+    float metresPerPixel=2*(distance+.65f)*.41421356f/panelHeight;
+    panX-=dx*metresPerPixel;panY+=dy*metresPerPixel;
+    lastRightX=(int)xpos;lastRightY=(int)ypos;
   }
 }
 
-// Scroll Callback — additive zoom matching lidar-core step feel
-void scroll_callback(GLFWwindow* win, double xoffset, double yoffset)
-{
-  (void)win;
+// Multiplicative dolly is distance-aware and never scales the world geometry.
+void scroll_callback(GLFWwindow* win,double xoffset,double yoffset){
   (void)xoffset;
-
-  double cx,cy; int ww,wh;
-  glfwGetWindowSize(win,&ww,&wh); glfwGetCursorPos(win,&cx,&cy);
-  if(cx<ww/2 || cy<84.0*wh/windowHeight || cy>wh-56.0*wh/windowHeight) return;
-  const float step = 0.1f;
-  if(yoffset > 0){
-    zoom += step;
-    if(zoom > 20.0f) zoom = 20.0f;
-  }else if(yoffset < 0){
-    zoom -= step;
-    if(zoom < 0.05f) zoom = 0.05f;
-  }
+  double cx,cy;int ww,wh;glfwGetWindowSize(win,&ww,&wh);glfwGetCursorPos(win,&cx,&cy);
+  if(cx<ww/2 || cy<84.0*wh/windowHeight || cy>wh-56.0*wh/windowHeight)return;
+  cameraView=0;
+  distance=clampf(distance*expf(-clampf((float)yoffset,-3,3)*.08f),.25f,30.f);
 }
 
 // Framebuffer resize callback
@@ -961,7 +1095,7 @@ void* viewerThread(void* id){
     return NULL;
   }
 
-  printf("Viewer ready. R=Record  P=Playback  S=Stop  | Left drag=Pan  Right drag=Rotate  Scroll=Zoom\n");
+  printf("Viewer ready. R=Record  P=Playback  S=Stop  | Left drag=Orbit  Right drag=Pan  Scroll=Dolly  F=Follow  C=Camera  H=Home\n");
 
   // Main loop
   while(viewerIsRunning && window && !glfwWindowShouldClose(window)){
@@ -1013,6 +1147,8 @@ void* viewerThread(void* id){
 
   free(previewPixels); previewPixels=NULL; previewCapacity=0;
   glDeleteTextures(1,&depthTexture);
+  glDeleteTextures(1,&colorTexture);
+  free(cameraRgb);cameraRgb=NULL;cameraRgbCapacity=0;
   if(window){
     glfwDestroyWindow(window);
     window = NULL;
