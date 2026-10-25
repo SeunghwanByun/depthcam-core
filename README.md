@@ -134,5 +134,15 @@ deduplicated on a 3 cm voxel grid, so long recordings keep mapping instead of
 filling the point budget with repeated observations.
 It does not add SLAM relocalization or repair accumulated drift.
 
+### VO feature overlay
+
+While VO runs, the left image shows each frame's feature pipeline (`O` toggles):
+grey = ORB feature without a match, red = matched but no valid depth (0.3–7 m)
+at the reference feature, yellow = has depth and is a PnP input, green = PnP
+inlier. Lines link each match to its position in the reference frame. The top
+bar lists `features > matches > with depth > inliers` and the loss reason, e.g.
+`LOST: matches lack valid depth` outdoors, where sunlight washes out the Astra's
+structured-light depth beyond the nearby ground.
+
 Camera pose/image consistency and lost-tracking/reset behavior are tested by
 `ctest --test-dir build --output-on-failure`.

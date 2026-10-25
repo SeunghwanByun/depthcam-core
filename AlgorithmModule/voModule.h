@@ -39,6 +39,22 @@ typedef struct {
 int voGetCameraState(VoCameraState* state, uint8_t* rgb, int rgbCapacity,
                      float* trajectory, int maxVertices);
 
+// Per-frame feature pipeline of the most recently processed frame, for debug
+// overlays. Pixel coordinates are in the VO input image. prevX/prevY is the
+// matched feature in the reference (last accepted) frame, valid for state >= 1.
+enum { VO_FEAT_UNMATCHED = 0, VO_FEAT_NO_DEPTH = 1, VO_FEAT_DEPTH = 2, VO_FEAT_INLIER = 3 };
+enum { VO_REASON_OK = 0, VO_REASON_INIT, VO_REASON_NO_FEATURES, VO_REASON_FEW_MATCHES,
+       VO_REASON_FEW_DEPTH, VO_REASON_PNP_FAILED, VO_REASON_IMPLAUSIBLE };
+typedef struct { float x, y, prevX, prevY; int state; } VoDebugFeature;
+typedef struct {
+    int width, height;
+    int features, matches, withDepth, inliers;
+    int reason;           // VO_REASON_*
+    unsigned int frame;   // increments for every processed frame
+} VoDebugStats;
+// Returns the number of features written (up to maxFeatures).
+int voGetDebugFrame(VoDebugStats* stats, VoDebugFeature* features, int maxFeatures);
+
 // Fast query — no copy.
 int voGetMapPointCount(void);
 
